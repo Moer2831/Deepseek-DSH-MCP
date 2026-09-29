@@ -167,6 +167,19 @@ const rawReap = Number(process.env.DSH_MCP_REAP_INTERVAL_MS ?? 30_000);
 export const REAP_INTERVAL_MS = Number.isFinite(rawReap) && rawReap >= 200 ? rawReap : 30_000;
 
 /**
+ * 最多同时保活多少个会话进程（`0` = 不限）。
+ *
+ * 为什么需要它：`IDLE_TTL_MS=0`（永不回收）能保证"GUI 抢不走写锁"，但代价是
+ * **每个用过的会话永久占一个 DSH 子进程** —— 实测约 120MB/个（线性），10 个就 ~1.2GB ✗。
+ * 设了本值之后，超过上限时**回收最久没用过的那个**（busy 的绝不回收）：
+ *   - 保活窗口内的会话：写锁在手，GUI 抢不走 ✓
+ *   - 窗口外的：进程回收、内存释放 ✓（下次派活自动 resume ✓）
+ * 即"**内存有界，锁尽量在手**"。建议值：8（≈1GB）；内存紧就 4，机器大就 0（不限）。
+ */
+const rawMaxLive = Number(process.env.DSH_MCP_MAX_LIVE ?? 0);
+export const MAX_LIVE = Number.isFinite(rawMaxLive) && rawMaxLive > 0 ? Math.floor(rawMaxLive) : 0;
+
+/**
  * `dsh_list` 的"磁盘探测"结果缓存多久（毫秒）。
  *
  * 为什么要缓存：列会话时要 spawn 一个 DSH 进程做 `session/list`（**实测约 1 秒**），

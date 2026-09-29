@@ -210,13 +210,18 @@ export const TOOL_DEFS = [
     name: 'dsh_release',
     description:
       '释放会话占用的 DSH 进程（释放写锁，让用户能在自己的 DSH GUI 里打开同一个会话）。' +
-      '会话本体留在磁盘上，之后仍可 resume；forget=true 才会从注册表里摘掉。',
+      '会话本体留在磁盘上，之后仍可 resume；forget=true 才会从注册表里摘掉。' +
+      '★ 用完了想一次性腾内存就传 all=true（默认"永不回收"下每个会话约 120MB，全放掉即立刻归零，之后随时 resume）。',
     inputSchema: S(
       {
         conversation_id: CONV_ID,
         forget: { type: 'boolean', description: '同时从本服务的注册表里移除，默认 false。' },
+        all: {
+          type: 'boolean',
+          description: '忽略 conversation_id，释放**所有**活着的会话进程（腾内存用）。默认 false。',
+        },
       },
-      ['conversation_id'],
+      [],
     ),
   },
   {
@@ -519,6 +524,17 @@ export function createHandlers(hub) {
     },
 
     async dsh_release(args) {
+      // ★ all=true：一次性放掉所有活着的会话进程（腾内存）。
+      //   无损：会话日志都在磁盘上，之后照样 resume。
+      if (args.all === true) {
+        const r = await hub.releaseAll();
+        return {
+          structured: { released: r.released, conversations: r.conversations },
+          text:
+            `已释放 ${r.released} 个会话进程（写锁全部让出，内存立刻回收）。` +
+            `\n会话日志都在磁盘上，之后派活会自动 resume；其中一个都没在跑时 released=0。`,
+        };
+      }
       const conv = hub.get(args.conversation_id);
       const r = await conv.close({ forget: args.forget === true });
       return {

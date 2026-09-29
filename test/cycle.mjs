@@ -188,8 +188,63 @@ try {
   await keep.callTool('dsh_release', { conversation_id: conv2, forget: true }, 60_000);
   await keep.close();
 
-  // ── [6] 收尾 ────────────────────────────────────────────────
-  console.log('\n[6] 收尾');
+  // ── [6] ★ 保活上限 MAX_LIVE：内存有界，锁尽量在手 ──────────────
+  console.log('\n[6] ★ DSH_MCP_MAX_LIVE=2 → 超标时回收最久没用过的（内存有界，锁尽量在手）');
+  const cap = new McpClient({
+    env: {
+      ...ENV,
+      DSH_MCP_STATE: join(ROOT, 'state-cap.json'),
+      DSH_MCP_IDLE_TTL_MS: '0', // 永不按空闲回收
+      DSH_MCP_MAX_LIVE: '2', // 但最多保活 2 个
+      DSH_MCP_REAP_INTERVAL_MS: '500',
+    },
+  }).start();
+  await cap.initialize();
+  const wsCap = join(ROOT, 'ws-cap');
+  mkdirSync(wsCap, { recursive: true });
+  const capIds = [];
+  for (let i = 1; i <= 3; i++) {
+    const st = await cap.callTool('dsh_start', { cwd: wsCap, permission: 'danger-full-access' }, 180_000);
+    capIds.push(st?.structuredContent?.conversation_id);
+    await sleep(1300); // 拉开 lastUsedAt，让"最久没用过"是确定的
+  }
+  await sleep(2500); // 等回收周期跑到
+  const alive = [];
+  for (const id of capIds) {
+    const s = await cap.callTool('dsh_status', { conversation_id: id });
+    alive.push(s?.structuredContent?.alive);
+  }
+  console.log(`    三个会话（按创建顺序）alive = ${JSON.stringify(alive)}`);
+  check('★ 最久没用过的那个被回收了', alive[0] === false, JSON.stringify(alive));
+  check('★ 最近用过的两个仍保活（写锁在手 → GUI 抢不走）', alive[1] === true && alive[2] === true, JSON.stringify(alive));
+
+  console.log('\n[7] ★ 用完了想一次性腾内存：dsh_release(all=true)');
+  const rel = await cap.callTool('dsh_release', { all: true }, 120_000);
+  check('★ 一次放掉所有活着的会话进程', rel?.structuredContent?.released === 2, JSON.stringify(rel?.structuredContent));
+  const listed = await cap.callTool('dsh_list', { include_closed: false });
+  check(
+    '放掉之后确实没有活着的进程（内存立刻归零）',
+    (listed?.structuredContent?.conversations ?? []).every((c) => !c.alive),
+    JSON.stringify((listed?.structuredContent?.conversations ?? []).map((c) => c.alive)),
+  );
+
+  // 无损：放掉/被回收的会话照样能 resume 回来接着用
+  const revived = await cap.callTool(
+    'dsh_send',
+    { conversation_id: capIds[0], prompt: '只回复两个字：复活', wait: true, timeout_ms: 300_000 },
+    360_000,
+  );
+  check('★★ 被回收的会话仍能 resume 并用（无损）', revived?.structuredContent?.stop_reason === 'end_turn', McpClient.text(revived).slice(0, 200));
+  check('拿到答复', /复活/.test(revived?.structuredContent?.answer ?? ''), JSON.stringify(revived?.structuredContent?.answer));
+  for (const id of capIds) {
+    try {
+      await cap.callTool('dsh_release', { conversation_id: id, forget: true }, 60_000);
+    } catch {}
+  }
+  await cap.close();
+
+  // ── [8] 收尾 ────────────────────────────────────────────────
+  console.log('\n[8] 收尾');
   await client.callTool('dsh_release', { conversation_id: conv, forget: true }, 60_000);
   check('已释放', true);
 } catch (e) {

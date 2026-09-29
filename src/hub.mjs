@@ -31,6 +31,7 @@ import {
   DEFAULT_REASONING_EFFORT,
   IDLE_TTL_MS,
   LIST_PROBE_TTL_MS,
+  MAX_LIVE,
   PERMISSION_TIERS,
   PROMPT_TIMEOUT_MS,
   REAP_INTERVAL_MS,
@@ -1232,26 +1233,52 @@ export class Hub {
    *
    * ★ 但**心跳必须一直续**，两种模式都一样：心跳停了，别的实例 90 秒后就会把我们
    *   判成"卡死"，`dsh_takeover` 于是会**杀掉我们正在跑的回合**。
+   *
+   * ★ `DSH_MCP_MAX_LIVE`（保活上限）：`IDLE_TTL_MS=0` 时进程会永远留着（实测约 120MB/个 ✗），
+   *   设了上限就在超标时回收**最久没用过**的那个（busy 的绝不回收）—— "内存有界，锁尽量在手"。
    */
   startReaper() {
     if (this.#reaper) return;
-    const neverReap = IDLE_TTL_MS === 0;
-    if (neverReap) {
-      this.log.info('[hub] DSH_MCP_IDLE_TTL_MS=0：不回收空闲进程（一直握着写锁，GUI 抢不走）；仍会续心跳');
+    const neverReapByIdle = IDLE_TTL_MS === 0;
+    if (neverReapByIdle) {
+      this.log.info(
+        `[hub] DSH_MCP_IDLE_TTL_MS=0：不按空闲回收进程（一直握着写锁，GUI 抢不走）` +
+          (MAX_LIVE > 0 ? `；超过保活上限 ${MAX_LIVE} 时回收最久没用过的` : '；未设保活上限，进程会一直留着'),
+      );
     }
     this.#reaper = setInterval(async () => {
       // ★ 整个回收周期必须自带防护：这里抛出的异常会变成 unhandled rejection，
       //   在 Node ≥15 上直接**杀掉进程** —— 而那会连带丢掉所有会话的活进程。
       try {
         const cutoff = now() - IDLE_TTL_MS;
+        // 哪些会话可以回收：进程活着、不在跑回合
+        const reapable = [];
         for (const c of this.conversations.values()) {
           if (!c.proc?.alive) continue;
           // ★ 先续心跳，**包括正在跑回合的**：否则长回合（>90 秒）期间心跳不刷新，
           //   别的实例会把我们判成失联并抢占，直接把这一轮杀掉。
           lockHeartbeat(c.id);
-          if (neverReap || c.busy) continue;
-          if (c.lastUsedAt > cutoff) continue;
-          this.log.info(`[hub] 空闲回收会话 ${c.id} 的进程（可 resume 复活）`);
+          if (c.busy) continue;
+          reapable.push(c);
+        }
+
+        // 回收哪些：① 空闲超过 TTL 的；② 超过 MAX_LIVE 上限时，最久没用过的那些
+        const victims = new Set();
+        if (IDLE_TTL_MS > 0) {
+          for (const c of reapable) if (c.lastUsedAt <= cutoff) victims.add(c);
+        }
+        if (MAX_LIVE > 0) {
+          // 保活窗口 = 最近用过的 MAX_LIVE 个；超出的按"最久没用"先回收
+          const byAge = reapable.slice().sort((a, b) => a.lastUsedAt - b.lastUsedAt);
+          const excess = byAge.length - MAX_LIVE;
+          for (let i = 0; i < excess; i++) victims.add(byAge[i]);
+        }
+
+        for (const c of victims) {
+          if (!c.proc?.alive) continue;
+          this.log.info(
+            `[hub] 回收会话 ${c.id} 的进程（${IDLE_TTL_MS > 0 && c.lastUsedAt <= cutoff ? '空闲超时' : `保活上限 ${MAX_LIVE}`}；可 resume 复活）`,
+          );
           const proc = c.proc;
           c.proc = null;
           // ★ 顺序要紧：**先确认子进程真的退出（写锁真的释放），再删登记**。
@@ -1265,6 +1292,26 @@ export class Hub {
       }
     }, REAP_INTERVAL_MS);
     this.#reaper.unref?.();
+  }
+
+  /**
+   * 释放**所有**活着的会话进程（腾内存用，无损：会话日志都在磁盘上，之后照样 resume）。
+   *
+   * 场景：默认"永不回收"下每个用过的会话会常驻一个 DSH 进程（实测约 120MB ✗）。
+   * 一批活干完了就调它，内存立刻归零 ✓；下次派活按需 resume ✓。
+   */
+  async releaseAll() {
+    const released = [];
+    for (const c of this.conversations.values()) {
+      if (!c.proc?.alive) continue;
+      const proc = c.proc;
+      c.proc = null;
+      await proc.stop().catch(() => {});
+      removeMarker(c.id);
+      released.push(c.id);
+    }
+    this.save();
+    return { released: released.length, conversations: released };
   }
 
   async shutdown() {
