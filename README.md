@@ -6,7 +6,7 @@
 
 An MCP server that drives DSH as a **long-lived agent runtime** instead of wrapping a CLI. Open a conversation, hand it a goal, and it writes code, runs scripts and spawns its own subagents — while you watch, cut in, and collect the result whenever you like. 🛠️
 
-🧪 299 checks green · 🔌 MCP over stdio · 📜 MIT · 💬 Community: [linux.do](https://linux.do/)
+🧪 299 checks green · 🔌 MCP over stdio · 📜 MIT · 💬 Community: [linux.do](https://linux.do/) 
 
 > 📌 **Read the [Usage Notes](USAGE-NOTES.en.md) first** — the practical gotchas that will actually bite you: the ACP model-config trap, external MCP tools bypassing DSH's sandbox, the workspace/GUI registry cache, cost control, and a troubleshooting table.
 
