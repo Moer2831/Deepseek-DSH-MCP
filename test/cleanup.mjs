@@ -54,8 +54,10 @@ let dirsRemoved = 0;
 try {
   for (const e of readdirSync(tmpdir(), { withFileTypes: true })) {
     if (!e.isDirectory()) continue;
-    // 只认本项目测试的命名前缀，避免误伤别人的临时目录
-    if (!/^dsh-mcp-(smoke|bound|int|async|sentinel|conc|cap|reason|acp|cfgopt|ws)/.test(e.name)) continue;
+    // 只认本项目测试的命名前缀，避免误伤别人的临时目录。
+    // ★ 用 `dsh-mcp-` 通配而不是逐个列举：以前是白名单，结果每加一个新套件就漏一个，
+    //   临时目录会慢慢堆积（demo/verify/permission/multi/list/prune/cycle/guards 全漏过）。
+    if (!/^dsh-mcp-/.test(e.name)) continue;
     const p = join(tmpdir(), e.name);
     if (!dryRun) rmSync(p, { recursive: true, force: true });
     dirsRemoved++;
