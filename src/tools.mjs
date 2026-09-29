@@ -560,8 +560,17 @@ export function createHandlers(hub) {
             ? '（本服务残留的孤儿，可 dsh_takeover 抢占）'
             : snap.lock_holder === 'live-mcp'
               ? '（另一个活着的 dsh-mcp 实例在用；要夺需 dsh_takeover(force=true)）'
-              : '（多半是你自己的 DSH GUI 正开着它；本服务不会去杀，请在那窗口里关掉）';
+              : '（多半是你自己的 DSH GUI 正开着它；本服务不会去杀它）';
         bits.push(`写锁=${snap.lock_holder}${hint}`);
+      }
+      // ★ 撞过锁就把"谁占用 + 怎么解"讲清楚。实测：GUI 点开一次就会长期持有写锁
+      //   （切走、等十几分钟都不释放），所以这条信息必须持久可见，而不是一闪而过的报错。
+      if (snap.lock_conflict) {
+        const lc = snap.lock_conflict;
+        const ago = Math.round((Date.now() - lc.at) / 1000);
+        bits.push(`⚠️ 最近一次撞锁：${ago}s 前，持有者=${lc.holder_kind}`);
+        bits.push(`   判定：${lc.reason}`);
+        bits.push(`   怎么办：${lc.hint}`);
       }
       return {
         structured: {
@@ -575,6 +584,7 @@ export function createHandlers(hub) {
           pending_approvals: snap.pending_approvals,
           turns: snap.turns,
           lock_holder: snap.lock_holder,
+          lock_conflict: snap.lock_conflict,
           run: run
             ? {
                 run_id: run.run_id,

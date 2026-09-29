@@ -141,7 +141,16 @@ export const PROMPT_TIMEOUT_MS = Number(process.env.DSH_MCP_PROMPT_TIMEOUT_MS ??
 /** 普通 ACP 请求的超时（毫秒）。 */
 export const REQUEST_TIMEOUT_MS = Number(process.env.DSH_MCP_REQUEST_TIMEOUT_MS ?? 60_000);
 
-/** 会话空闲多久后回收其 DSH 进程（毫秒）。回收不等于丢弃——会话可用 resume 复活。 */
+/**
+ * 会话空闲多久后回收其 DSH 进程（毫秒）。回收不等于丢弃——会话可用 resume 复活。
+ *
+ * ★ 设为 `0` = **永不回收**（推荐给"我会在 GUI 里看进度"的用户）：
+ *   本服务会一直握着写锁，于是 GUI 抢不走它 —— GUI 那边只会看到一个显式、无害的
+ *   「已被占用」提示，而本服务的任务照跑、之后也照常接回。
+ *   （反过来：一旦回收把锁空出来，你在 web 里点开那条会话，`dsh web` 会**永久**持有写锁，
+ *    切走/等待/归档都不释放，本服务之后每一次 resume 都会失败。）
+ *   代价：每个会话常驻一个 DSH 进程。
+ */
 export const IDLE_TTL_MS = Number(process.env.DSH_MCP_IDLE_TTL_MS ?? 5 * 60 * 1000);
 
 /** 后台回收扫描间隔（毫秒）。 */

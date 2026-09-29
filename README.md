@@ -6,7 +6,7 @@
 
 An MCP server that drives DSH as a **long-lived agent runtime** instead of wrapping a CLI. Open a conversation, hand it a goal, and it writes code, runs scripts and spawns its own subagents — while you watch, cut in, and collect the result whenever you like. 🛠️
 
-🧪 457 checks green · 🔌 MCP over stdio · 📜 MIT · 💬 Community: [linux.do](https://linux.do/)
+🧪 463 checks green · 🔌 MCP over stdio · 📜 MIT · 💬 Community: [linux.do](https://linux.do/)
 
 > 📌 **Read the [Usage Notes](USAGE-NOTES.en.md) first** — the practical gotchas that will actually bite you: the ACP model-config trap, external MCP tools bypassing DSH's sandbox, the workspace/GUI registry cache, cost control, and a troubleshooting table.
 
@@ -254,6 +254,7 @@ Silent by default — **not one byte is written**.
 | `DSH_MCP_RUNS_DIR` | `<state file dir>/runs` | Root for async completion sentinels (`<this>/<conversation_id>/<run_id>.json`) |
 | `DSH_MCP_LOCKS_DIR` | `<state file dir>/locks` | Holder registrations for the write lock. ⚠️ **All instances must agree on this value**, or they cannot see each other's registrations and will misread each other as an unidentifiable holder (a GUI) and refuse to preempt |
 | `DSH_MCP_LOCK_STALE_MS` | `90000` | How long without a heartbeat before a holder counts as lost (and becomes auto-preemptible by `dsh_takeover`) |
+| `DSH_MCP_IDLE_TTL_MS` | `300000` (5 min) | How long a conversation may sit idle before its DSH process is reaped. ★★ **Set `0` to never reap** — the server then keeps holding the write lock, so **the GUI cannot take it** (the GUI just sees a harmless "already in use", while turns keep running and later calls reconnect). Cost: one resident DSH process per conversation |
 | `DSH_MCP_LIST_PROBE_TTL_MS` | `10000` | Cache lifetime for `dsh_list`'s on-disk probe (the probe spawns a DSH process and takes ~1 s) |
 | `DSH_MCP_SENTINEL_TTL_MS` | `604800000` (7 days) | Startup pruning age for sentinels; `0` disables pruning |
 | `DSH_MCP_SENTINEL_INCLUDE_REASONING` | unset | `1` writes `result.thinking` into the sentinel (**breaks the never-on-disk guarantee**) |
@@ -286,7 +287,7 @@ The suite **cleans up after itself**: `run.mjs` always ends with `cleanup.mjs`, 
 | `prune` | 11 | **sentinel retention**: prunes over-age and crash-leftover files, keeps fresh ones, removes empty shells, `TTL=0` disables pruning, and never touches the conversation registry beside it (no tokens, runs every time) |
 | `timeout` | 38 | **timeout semantics**: `wait=false` is unaffected by `timeout_ms`; a `wait=true` expiry merely downgrades to background (turn not cancelled, result not lost, `busy` never lies); `timeout_ms<=0` waits forever; a failed resume invalidates the process instead of wedging the conversation; an empty prompt yields a clear error |
 | `lock` | 79 | **write lock and preemption**: four holder classifications, `writeMarker` never overwriting a live holder, malformed/missing registration edge cases; **end-to-end** with two real MCP instances fighting over one conversation → clear error → refusal → `force` takeover; **a crash releases the lock automatically**, **a wedged holder is preempted without `force`**; plus the "one turn, one sentinel" invariant (inline turns and idle interjects included) |
-| `cycle` | 20 | **the async dispatch lifecycle**: dispatch → collect the sentinel → idle reap → dispatch again, three rounds with no lock error; re-dispatch right on the reap boundary (widening the race); an immediate re-dispatch after `dsh_release`; and an assertion that reaping leaves no unattributable lock (this suite caught the reaper collecting a freshly spawned process as if it were idle) |
+| `cycle` | 26 | **the async dispatch lifecycle**: dispatch → collect the sentinel → idle reap → dispatch again, three rounds with no lock error; re-dispatch right on the reap boundary (widening the race); an immediate re-dispatch after `dsh_release`; and an assertion that reaping leaves no unattributable lock (this suite caught the reaper collecting a freshly spawned process as if it were idle) |
 | `concurrency` | 31 | three simultaneous conversations + live incremental reads |
 | `capability` | 22 | writing code, running scripts, **spawning its own subagents** (verified on disk via child session headers) |
 | `workspace-effect` | 24 | workspace actually effective when no path is given |
@@ -296,7 +297,7 @@ The suite **cleans up after itself**: `run.mjs` always ends with `cleanup.mjs`, 
 | `permission` | 11 | ★ **whether the permission tiers actually take effect** (a safety property): it ignores our own return values (the very thing that used to lie) and reads **the session's own record** (`permissions.preset` / `sandboxMode` in the projection cache), checking all three tiers and that their recorded values differ. **This suite caught a silent privilege escalation**: a `defaultPreset` in the profile overrides `DSH_PERMISSION_MODE` at session creation |
 | `list` | 13 | **the cost of `dsh_list`** (measured): a default call with the on-disk probe takes ~1 s (it spawns a DSH process) while **repeated calls hit a cache and drop to single-digit milliseconds**; `only_running=true` and `include_closed=false` **skip the probe** with equivalent semantics (unopened on-disk sessions are simply excluded) |
 
-**Total: 457 checks, all green.** (421 in-suite + 36 acceptance)
+**Total: 463 checks, all green.** (427 in-suite + 36 acceptance)
 
 ## 🔒 The write lock: one writer per conversation at a time
 
@@ -327,6 +328,10 @@ A DSH session directory carries a **cross-process write lock** whose semantics a
 > **★ Why "just opening it" is not safe either (measured A/B)**: the lease really is "held while the holder lives", and **reading content or listing directories is unaffected** — but **clicking a conversation open in the GUI itself** takes a write handle, so **`dsh web` walks away with the lock**. Measured: with the conversation only in the MCP's hands the probe reports **free**; the moment you open it in the web UI it becomes **held: "already owned by an active write handle"**.
 >
 > **★★ And navigating away does not give it back (also measured)**: after you switch to another conversation the lock is **still** held by `dsh web`. In other words, **opening it once hands that conversation to the GUI for the whole lifetime of the web process**; the MCP cannot touch it again until you **restart `dsh web`**. (That explains "the caller can never get back in after a task": it is not taken every time — it is taken once and stays taken.)
+>
+> **★ Even archiving the conversation does not release it (measured, with the archive verified to have landed)**: the docs say archiving releases its reference, but the write lock is **not** released with it. So the only known way out is **restarting `dsh web`** (lossless in data terms: the conversation itself is intact and resumes normally afterwards).
+>
+> **★★ The lossless answer: keep the MCP holding the lock — do not let it go free.** Set **`DSH_MCP_IDLE_TTL_MS=0`** (never reap). Idle reaping saves memory, but it is also the only moment the write lock becomes **free** — and that is exactly when the GUI can take it, after which the MCP never gets it back. With reaping disabled, opening the conversation in the GUI gives **the GUI a clear, harmless "already in use"** while **the MCP is unaffected**: turns keep running and later calls reconnect normally. The cost is one resident DSH process per conversation — which is why reaping exists at all. **Set it to 0 to trade a silent, permanent breakage for an explicit, visible conflict.**
 >
 > **So to watch progress use `dsh_read` (the MCP tool, with cursor-based incremental reads) or wait for the sentinel file — not the GUI.** If you really want the GUI view, `dsh_release` first (note that this interrupts a running turn, so it only fits the gaps between tasks).
 >

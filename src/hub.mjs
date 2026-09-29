@@ -144,6 +144,8 @@ export class Conversation {
     this.busy = false;
     /** 本进程为这个会话拉起过的最后一个子进程 PID（登记被删后仍能归因锁的归属）。 */
     this.lastChildPid = null;
+    /** 最近一次撞写锁的记录 `{at, holder_kind, reason, hint}`（见 snapshot()）。 */
+    this.lockConflict = null;
     this.pendingApprovals = new Map();
     /** 等待"当前回合结束"的回调队列，供插话排队使用。 */
     this.idleWaiters = [];
@@ -221,6 +223,11 @@ export class Conversation {
       pending_approvals: [...this.pendingApprovals.keys()],
       /** 不在本进程手里时，写锁在谁手上（none=多半是你自己的 GUI / stale-mcp=可抢占的孤儿 / live-mcp=另一个实例）。 */
       lock_holder: this.proc?.alive ? 'self' : classifyHolder(this.id, { knownChildPid: this.lastChildPid }).kind,
+      /** ★ 最近一次"撞写锁"的持久记录。
+       *  只报一次错是不够的：撞锁往往**一次就长期成立**（实测：在 GUI 里点开一次，
+       *  dsh web 会一直持有写锁，切走/等待都不释放），所以要把"谁占用、怎么解"留在状态里，
+       *  否则用户下次只会看到一句没有上下文的报错。 */
+      lock_conflict: this.lockConflict,
     };
   }
 
@@ -259,6 +266,7 @@ export class Conversation {
       for (const f of this.lastConfigApplied.failed) this.#hub.log.info(`[conv ${this.id}] ${f}`);
       // 锁到手了，这时才登记；从此别人能查到"锁在我们手上"
       writeMarker(this.id, { childPid: proc.pid, cwd: this.cwd });
+      this.lockConflict = null; // 拿到锁了，之前的撞锁记录作废
       this.#hub.log.info(`[conv ${this.id}] 已 resume`);
       return proc;
     } catch (e) {
@@ -277,6 +285,23 @@ export class Conversation {
       // ACP 包成 -32603 "Internal error"，只说这句调用方根本不知道该怎么办。
       if (isLeaseError(e.message)) {
         const holder = classifyHolder(this.id, { knownChildPid: this.lastChildPid });
+        // ★ 留下持久记录（snapshot().lock_conflict）。撞锁常常**一次就长期成立**：
+        //   实测在 GUI 里点开一次，dsh web 就会一直持有写锁（切走、等十几分钟都不释放）。
+        //   只报一次错的话，用户下次只会看到一句没有上下文的失败。
+        this.lockConflict = {
+          at: now(),
+          holder_kind: holder.kind,
+          holder: holder.marker ?? null,
+          reason: holder.reason,
+          hint:
+            holder.kind === 'none'
+              ? '持有者不是本服务拉起的进程 —— 多半是你自己的 DSH GUI。解法（无损、可逆）：在那个会话的菜单里点「归档会话」让它释放 reference，需要时再「取消归档」；实在不行就重启 dsh web。'
+              : holder.kind === 'stale-mcp'
+                ? '持有者已失联（心跳过期）或是本进程的残留子进程 —— 直接 dsh_takeover，无需 force。'
+                : holder.kind === 'live-mcp'
+                  ? '另一个活着的 dsh-mcp 实例持有它：在那边 dsh_release，或用 dsh_takeover(force=true) 夺过来。'
+                  : '稍后重试。',
+        };
         const err = new Error(describeLeaseConflict(this.id, holder));
         err.code = 'session-writer-held';
         err.holder = holder;
@@ -1194,9 +1219,21 @@ export class Hub {
     return [...out.values()];
   }
 
-  /** 空闲回收：停掉闲置进程，会话本身保留（可 resume 复活）。 */
+  /** 空闲回收：停掉闲置进程，会话本身保留（可 resume 复活）。
+   *
+   * ★ `DSH_MCP_IDLE_TTL_MS=0` 表示**永不回收**（不是"立即回收"）。
+   *   这是一个真实可用的策略，不只是开关：**只要本服务还握着写锁，GUI 就抢不走它**。
+   *   实测（见 USAGE-NOTES §3.10/3.11）：一旦空闲回收把子进程收掉、锁空出来，
+   *   你在这时去 web 里点开那条会话，`dsh web` 会**永久**持有写锁（切走、等待、归档都不释放），
+   *   于是本服务之后每一次 resume 都失败 —— 用户看到的正是"任务跑完后接不回去"。
+   *   不回收 = 把"静默的永久损坏"换成"GUI 侧一个显式、无害的『已被占用』提示"。
+   *   代价是每个会话常驻一个 DSH 进程（内存），这本来就是回收机制存在的理由。 */
   startReaper() {
     if (this.#reaper) return;
+    if (IDLE_TTL_MS === 0) {
+      this.log.info('[hub] DSH_MCP_IDLE_TTL_MS=0：不回收空闲进程（会话会一直握着写锁，GUI 抢不走）');
+      return;
+    }
     this.#reaper = setInterval(async () => {
       // ★ 整个回收周期必须自带防护：这里抛出的异常会变成 unhandled rejection，
       //   在 Node ≥15 上直接**杀掉进程** —— 而那会连带丢掉所有会话的活进程。

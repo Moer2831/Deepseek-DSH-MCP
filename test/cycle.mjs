@@ -123,8 +123,35 @@ try {
   check('★ 交还后立刻重派成功（无锁错误）', after?.structuredContent?.stop_reason === 'end_turn' && !/写锁|占用/i.test(McpClient.text(after)), McpClient.text(after).slice(0, 260));
   check('拿到答复', /归还/.test(after?.structuredContent?.answer ?? ''), JSON.stringify(after?.structuredContent?.answer));
 
-  // ── [5] 收尾 ────────────────────────────────────────────────
-  console.log('\n[5] 收尾');
+  // ── [5] ★ TTL=0 = 永不回收（锁不会被腾出来让 GUI 抢走）─────────
+  console.log('\n[5] ★ DSH_MCP_IDLE_TTL_MS=0 → 永不回收（把"锁被别人抢走"这条路堵死）');
+  // 独立实例：TTL=0（永不回收）+ 极快扫描间隔，若语义仍是"立即回收"，子进程会被秒收。
+  const STATE2 = join(ROOT, 'state-ttl0.json');
+  const keep = new McpClient({
+    env: { ...ENV, DSH_MCP_STATE: STATE2, DSH_MCP_IDLE_TTL_MS: '0' },
+  }).start();
+  await keep.initialize();
+  const ws2 = join(ROOT, 'ws-keep');
+  mkdirSync(ws2, { recursive: true });
+  const st2 = await keep.callTool('dsh_start', { cwd: ws2, permission: 'danger-full-access' }, 180_000);
+  const conv2 = st2?.structuredContent?.conversation_id;
+  check('TTL=0 的实例建好会话', !!conv2, McpClient.text(st2).slice(0, 140));
+  const mark2 = readMarkerSafe(conv2);
+  check('它登记了子进程', typeof mark2?.child_pid === 'number', JSON.stringify(mark2));
+  const childPid = mark2?.child_pid;
+
+  // 等得比"回收窗口"长得多（若还在回收，早就该被收掉了）
+  await sleep(4000);
+  check('★ 子进程仍活着（没有被当空闲收掉）', locks.isPidAlive(childPid), `PID ${childPid}`);
+  const stKeep = await keep.callTool('dsh_status', { conversation_id: conv2 });
+  check('★ 会话仍然是 alive（一直握着写锁 → GUI 抢不走）', stKeep?.structuredContent?.alive === true, JSON.stringify(stKeep?.structuredContent?.alive));
+  check('★ lock_holder 仍是 self', stKeep?.structuredContent?.lock_holder === 'self', JSON.stringify(stKeep?.structuredContent?.lock_holder));
+  check('登记还在（别人查得到"锁在我们手上"）', !!readMarkerSafe(conv2), 'marker 存在');
+  await keep.callTool('dsh_release', { conversation_id: conv2, forget: true }, 60_000);
+  await keep.close();
+
+  // ── [6] 收尾 ────────────────────────────────────────────────
+  console.log('\n[6] 收尾');
   await client.callTool('dsh_release', { conversation_id: conv, forget: true }, 60_000);
   check('已释放', true);
 } catch (e) {
