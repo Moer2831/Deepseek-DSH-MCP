@@ -1,0 +1,45 @@
+/**
+ * 测试入口：先跑冒烟（不花 token），再跑集成（会调用真实 LLM）。
+ * 用法：npm test          只跑冒烟
+ *       npm test -- --all 冒烟 + 集成
+ */
+
+import { spawn } from 'node:child_process';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const HERE = dirname(fileURLToPath(import.meta.url));
+const all = process.argv.includes('--all');
+
+function run(script) {
+  return new Promise((resolve) => {
+    console.log(`\n${'█'.repeat(70)}\n█ ${script}\n${'█'.repeat(70)}`);
+    const child = spawn(process.execPath, [join(HERE, script)], { stdio: 'inherit' });
+    child.on('exit', (code) => resolve(code ?? 1));
+  });
+}
+
+let code = await run('smoke.mjs');
+if (code === 0 && all) {
+  code = await run('boundary.mjs');
+}
+if (code === 0 && all) {
+  code = await run('integration.mjs');
+}
+if (code === 0 && all) {
+  code = await run('async.mjs');
+}
+if (code === 0 && all) {
+  code = await run('concurrency.mjs');
+}
+if (code === 0 && all) {
+  code = await run('capability.mjs');
+}
+if (code === 0 && all) {
+  code = await run('workspace-effect.mjs');
+}
+if (code === 0 && all) {
+  code = await run('reasoning-check.mjs');
+}
+console.log(`\n总结果: ${code === 0 ? '通过 ✅' : '失败 ❌'}`);
+process.exit(code);

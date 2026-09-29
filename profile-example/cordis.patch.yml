@@ -1,0 +1,98 @@
+# ============================================================================
+#  dsh-mcp profile 补丁层 —— 示例模板
+# ============================================================================
+#  用法：
+#    1) dsh dsh-mcp --from-default-profile acp
+#    2) 把本文件复制成 ~/.dsh/profiles/dsh-mcp/cordis.patch.yml
+#    3) 把下面所有占位符换成你自己的 provider / 模型
+#
+#  ⚠️ 三个必须知道的点：
+#
+#  【1】ACP 的模型不走 `agent-default-model`。
+#      它读的是 `dsh-acp` 插件自己的 `config.provider` / `config.model`，
+#      而 acp bundle 把它硬编码成了 deepseek-official。所以下面那个 `id: acp`
+#      的覆盖是**必须的** —— 不写的话会话会跑在错误的 provider 上，
+#      报 `no API key for provider route "deepseek-official"`。
+#
+#  【2】ACP 的 `reasoning_effort` 默认是空串（= Provider default），不是最大档。
+#      本 MCP 服务会在每次 session/new 与每次 session/resume 之后显式设成 max，
+#      所以这里不用管；但你要知道"max"不是 ACP 的默认行为。
+#
+#  【3】`config` 是**整体替换**，不是深合并。所以覆盖某一行时要把它的字段写全。
+#
+#  另外：`insert:` 才是"新增插件行"。裸写 `- id: xxx` + `name:` 是"覆盖已存在的行"
+#  语义，匹配不到 id 时只会打印 `patch: entry not found` 然后**静默跳过**。
+# ============================================================================
+
+# ── 你的模型供应商 ──────────────────────────────────────────────────────────
+- id: llm-pi-ai
+  name: "@deepseek-ai/dsh-llm-pi-ai"
+  config:
+    providers:
+      myprovider:                                  # ← 你的 provider 名
+        displayName: My Provider
+        apiKeyEnv: MY_API_KEY                      # ← 存放密钥的环境变量名
+        api: openai-completions                    # openai-completions | ...
+        baseURL: https://api.example.com/v1        # ← 你的网关地址
+        models:
+          - id: my-model                           # ← 模型 id
+            name: my-model
+            input:
+              - text
+              - image
+            reasoningEfforts:                      # 该模型支持的思考档位
+              low: low
+              medium: medium
+              high: high
+              xhigh: xhigh
+              max: max
+            compat:
+              supportsStore: false
+              supportsDeveloperRole: false
+              maxTokensField: max_tokens
+              requiresReasoningContentOnAssistantMessages: true
+              thinkingFormat: deepseek
+            contextWindow: 1000000
+            maxTokens: 256000
+
+# ── 默认模型（给非 ACP 入口用；ACP 请见下面的 acp 行） ──────────────────────
+- id: agent-default-model
+  name: "@deepseek-ai/dsh-agent-default-model"
+  config:
+    provider: myprovider
+    model: my-model
+    reasoningEffort: max
+
+# ── ★ 关键：ACP 会话真正使用的 provider / model ─────────────────────────────
+- id: acp
+  name: "@deepseek-ai/dsh-acp"
+  config:
+    provider: myprovider
+    model: my-model
+
+# ── 权限预设（本 MCP 服务按会话切换） ───────────────────────────────────────
+- id: permission
+  name: "@deepseek-ai/dsh-permission-presets"
+  config:
+    presets:
+      read-only:
+        sandbox: read-only
+        approval: ask
+      workspace-write:
+        sandbox: workspace-write
+        approval: ask
+      danger-full-access:
+        sandbox: danger-full-access
+        approval: never
+    defaultPreset: danger-full-access
+
+# ── 打开 LLM 生成会话标题（出厂在 acp 模板里是 disabled） ───────────────────
+- id: session-title-llm
+  name: "@deepseek-ai/dsh-session-title-first-prompt-llm"
+  config:
+    targetWords: 5
+    targetCjkCharacters: 10
+    maxInputBytes: 4096
+    maxOutputTokens: 64
+    timeoutMs: 60000
+  disabled: false

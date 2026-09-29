@@ -1,0 +1,17 @@
+{
+  "name": "dsh-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "MCP server that drives DeepSeek Harness (DSH) as a long-lived coding agent over the Agent Client Protocol",
+  "bin": {
+    "dsh-mcp": "./bin/dsh-mcp.mjs"
+  },
+  "scripts": {
+    "start": "node ./bin/dsh-mcp.mjs",
+    "test": "node ./test/run.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
