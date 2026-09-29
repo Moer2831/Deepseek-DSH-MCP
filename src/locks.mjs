@@ -136,9 +136,25 @@ export function readMarker(conversationId) {
  * 判定当前持有者属于哪一类。
  * @returns {{kind:'none'|'self'|'stale-mcp'|'live-mcp', marker:object|null, childAlive:boolean, mcpAlive:boolean, ageMs:number|null, reason:string}}
  */
-export function classifyHolder(conversationId) {
+export function classifyHolder(conversationId, { knownChildPid = null } = {}) {
   const marker = readMarker(conversationId);
+  const knownAlive = isPidAlive(knownChildPid);
   if (!marker) {
+    // ★ 兜底归因：这个会话本进程曾经拉起过子进程（knownChildPid），它可能还活着握着锁，
+    //   而登记已经随回收被删掉了。若不认它，就只能判成 none → 连 dsh_takeover 都拒绝，
+    //   会话卡死到那个残留进程自己退出为止（而租约**没有过期机制**）。
+    //   "异步派活 → 等 task → 回头再进" 正好会撞上这个窗口。
+    if (knownAlive) {
+      return {
+        kind: 'stale-mcp',
+        marker: null,
+        childAlive: true,
+        mcpAlive: true,
+        ageMs: 0,
+        known_child_pid: knownChildPid,
+        reason: `本进程**上一代**子进程（PID ${knownChildPid}）还活着并握着锁，但它的登记已随回收被删除`,
+      };
+    }
     return {
       kind: 'none',
       marker: null,
@@ -154,6 +170,17 @@ export function classifyHolder(conversationId) {
   const isSelf = marker.mcp_pid === process.pid && marker.mcp_token === MCP_TOKEN;
 
   if (!childAlive) {
+    if (knownAlive) {
+      return {
+        kind: 'stale-mcp',
+        marker,
+        childAlive: true,
+        mcpAlive,
+        ageMs,
+        known_child_pid: knownChildPid,
+        reason: `登记里的子进程已退出，但**本进程上一代子进程**（PID ${knownChildPid}）还活着并握着锁`,
+      };
+    }
     return { kind: 'none', marker, childAlive, mcpAlive, ageMs, reason: '登记还在，但它记录的 DSH 子进程已经退出（锁已释放）' };
   }
   if (isSelf) {

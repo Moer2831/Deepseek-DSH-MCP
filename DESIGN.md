@@ -250,6 +250,9 @@ Profile = `~/.dsh/profiles/<name>/`，由 `package.json` 的 `dsh.profile.bundle
 - **★ 崩溃不会留孤儿（实测结论）**：子进程的 stdio 是连着父进程的管道，`SIGKILL` MCP → 管道关闭 → 子进程见 EOF 自杀 → **锁自动释放**。所以 `stale-mcp` 真正对应的是"**持有者活着但卡死**"（心跳过期），而不是"崩溃残留"。（代价：崩溃时进行中的回合会中断且**哨兵不会落地**，只能靠核对工作区状态。）
 - **两条独立 spawn 路径都要登记**：`ensureAlive()` **和** `Hub.create()` —— 新建会话走后者，漏登记会让"本服务自己持有的会话"被判成 `none` 而拒绝抢占（同样真实踩到）。
 - **错误翻译**：`SessionAlreadyOwnedError` 不是 `RequestError`，ACP 把它包成 `-32603 "Internal error"` 并把真实原因放 `error.data`；本服务取出 `data`，识别 `already owned` / `writer-held` / 中文「已被占用」，转成"谁持有 + 该怎么办"。
+- **★ 收尾必须等进程真死**：`AcpProcess.stop()` 在超时强杀后**再等 'exit'**（`killWaitMs`），回收时也**先 `stop()` 再删登记**。旧实现 kill 完立刻 resolve，于是"子进程还活着、还握着锁"时我们就往下走：删登记 → spawn 新进程 → resume 撞上一个**无法归因的锁**（登记没了 → `none` → 连 `takeover` 都拒绝）。这正是"异步派活 → 等 task → 回头再进就报有锁"的一个真实来源（`test/cycle.mjs` 守着）。
+- **★ `busy` 必须在 `ensureAlive()` 之前置位**：否则"把进程拉起来"（spawn + initialize + resume，可能好几秒）是一个**裸奔窗口** —— ① reaper 看到 `busy=false` 且 `lastUsedAt` 已过期，会把**刚拉起来**的进程当空闲回收掉，紧接着 resume 就报"DSH 进程未运行"；② 第二个 `dsh_send` 也能通过 busy 检查，为同一会话再拉一个子进程（互相撞锁 + 泄漏）。失败路径必须放开 `busy`，否则会话被永久占住。（`test/cycle.mjs` 实测抓到。）
+- **兜底归因 `lastChildPid`**：`Conversation` 记住本进程为该会话拉起过的最后一个子进程 PID；`classifyHolder(id, {knownChildPid})` 在"登记已被删、但那个 PID 还活着"时仍判为 `stale-mcp`（可自动抢占），而不是误判成 `none` 拒绝。
 - **绝不杀 GUI**：GUI 会话跑在 `dsh web` 单进程内（非一会话一进程），杀它 = 整个界面 + 该进程全部 GUI 会话一起断。因此 `none` 分支只报告不动手。
 - **多实例可见性**：`Hub.get()` 命中不到时先 `adoptNewFromDisk()`（只增补、不覆盖内存中的活会话），否则"另一个实例刚建的会话"会被误报成「未知会话」。
 

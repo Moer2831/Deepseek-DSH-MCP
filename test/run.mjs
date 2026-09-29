@@ -43,6 +43,9 @@ if (code === 0 && all) {
   code = await run('lock.mjs');
 }
 if (code === 0 && all) {
+  code = await run('cycle.mjs');
+}
+if (code === 0 && all) {
   code = await run('concurrency.mjs');
 }
 if (code === 0 && all) {

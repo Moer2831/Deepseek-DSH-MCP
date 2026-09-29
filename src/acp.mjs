@@ -225,24 +225,32 @@ export class AcpProcess {
   #initResult = null;
 
   /** 优雅收尾：close 由调用方负责，这里只关 stdin（DSH 绑定 stdin EOF → 有界退出）。 */
-  async stop({ graceMs = 3000 } = {}) {
+  async stop({ graceMs = 3000, killWaitMs = 5000 } = {}) {
     const child = this.#child;
     if (!child) return;
     this.#stopping = true;
     try {
       child.stdin.end();
     } catch {}
-    await new Promise((resolve) => {
-      const t = setTimeout(() => {
-        try {
-          child.kill();
-        } catch {}
-        resolve();
-      }, graceMs);
-      child.once('exit', () => {
-        clearTimeout(t);
-        resolve();
+    const waitExit = (ms) =>
+      new Promise((resolve) => {
+        if (child.exitCode !== null || child.signalCode !== null) return resolve(true);
+        const t = setTimeout(() => resolve(false), ms);
+        child.once('exit', () => {
+          clearTimeout(t);
+          resolve(true);
+        });
       });
-    });
+    // 1) 先给它体面退出的机会（stdin EOF → DSH 有界退出）
+    if (await waitExit(graceMs)) return;
+    // 2) 超时则强杀，**并且等它真的退出**。
+    //    ★ 旧实现 kill() 之后立刻 resolve —— 于是调用方会在"子进程还活着、还握着写锁"
+    //      的时候继续往下走：删掉登记、再 spawn 新进程去 resume，就会撞上一个**无法归因的锁**
+    //      （登记没了 → classifyHolder 判成 none → 连 dsh_takeover 都会拒绝）。
+    //      这就是"异步派活 → 等 task → 回头再进就报有锁"的一个真实来源。
+    try {
+      child.kill();
+    } catch {}
+    await waitExit(killWaitMs);
   }
 }

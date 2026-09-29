@@ -48,6 +48,7 @@ import {
   describeLeaseConflict,
   heartbeat as lockHeartbeat,
   isLeaseError,
+  isPidAlive,
   killHolderChild,
   removeMarker,
   writeMarker,
@@ -140,6 +141,8 @@ export class Conversation {
 
     this.proc = null;
     this.busy = false;
+    /** 本进程为这个会话拉起过的最后一个子进程 PID（登记被删后仍能归因锁的归属）。 */
+    this.lastChildPid = null;
     this.pendingApprovals = new Map();
     /** 等待"当前回合结束"的回调队列，供插话排队使用。 */
     this.idleWaiters = [];
@@ -216,7 +219,7 @@ export class Conversation {
       context_pressure: meta?.pressure ?? null,
       pending_approvals: [...this.pendingApprovals.keys()],
       /** 不在本进程手里时，写锁在谁手上（none=多半是你自己的 GUI / stale-mcp=可抢占的孤儿 / live-mcp=另一个实例）。 */
-      lock_holder: this.proc?.alive ? 'self' : classifyHolder(this.id).kind,
+      lock_holder: this.proc?.alive ? 'self' : classifyHolder(this.id, { knownChildPid: this.lastChildPid }).kind,
     };
   }
 
@@ -234,6 +237,9 @@ export class Conversation {
     });
     proc.start();
     this.proc = proc;
+    // 记住"本进程为这个会话拉起过的最后一个子进程"。回收/重派时若登记已被删掉、
+    // 而这个 PID 还活着，锁就能被正确归因成"我们自己的残留"（否则只能判 none → 无法抢占）。
+    this.lastChildPid = proc.pid;
     // ★ 登记**推迟到真正拿到写锁之后**（见下面 resume 成功处）。
     //   登记的含义是"我正持有这个会话的写锁"，不是"我拉起了一个进程"。
     //   若在这里就写，一次注定撞锁失败的 resume 会先把"谁持有"的线索覆盖掉、
@@ -269,7 +275,7 @@ export class Conversation {
       // 写锁冲突是最常见也最需要"说人话"的失败：DSH 的 SessionAlreadyOwnedError 会被
       // ACP 包成 -32603 "Internal error"，只说这句调用方根本不知道该怎么办。
       if (isLeaseError(e.message)) {
-        const holder = classifyHolder(this.id);
+        const holder = classifyHolder(this.id, { knownChildPid: this.lastChildPid });
         const err = new Error(describeLeaseConflict(this.id, holder));
         err.code = 'session-writer-held';
         err.holder = holder;
@@ -312,9 +318,11 @@ export class Conversation {
     }
 
     // 2) 分类处置
-    const holder = classifyHolder(this.id);
+    const holder = classifyHolder(this.id, { knownChildPid: this.lastChildPid });
     report.holder_kind = holder.kind;
     report.holder = holder.marker;
+    // 登记可能已随回收被删，但"我们自己的残留子进程"仍可归因（见 locks.classifyHolder）
+    const killTarget = holder.marker?.child_pid ?? holder.known_child_pid ?? null;
 
     if (holder.kind === 'none' || !holder.childAlive) {
       report.message =
@@ -331,23 +339,28 @@ export class Conversation {
     }
 
     // 3) 杀 + 重试（内核在持有者进程退出时释放信号量）
-    const kill = killHolderChild(holder.marker.child_pid);
-    report.killed_pid = holder.marker.child_pid;
+    const kill = killHolderChild(killTarget);
+    report.killed_pid = killTarget;
     report.kill = kill;
     if (!kill.killed) {
       report.message = `抢占失败：${kill.reason}`;
       return report;
     }
     removeMarker(this.id, { force: true });
-    await new Promise((r) => setTimeout(r, 500)); // 给内核一点时间回收锁
+    // 等它**真的**退出再接管：只发 kill 就立刻 resume 会撞上尚未释放的锁
+    // （进程退出与内核回收信号量之间有一小段窗口）。
+    for (let i = 0; i < 20; i++) {
+      if (!isPidAlive(killTarget)) break;
+      await new Promise((r) => setTimeout(r, 250));
+    }
     try {
       await this.ensureAlive();
       report.ok = true;
       report.message =
-        `已抢占：杀掉持有者 PID ${holder.marker.child_pid}（${holder.reason}），并成功接管会话。` +
+        `已抢占：杀掉持有者 PID ${killTarget}（${holder.reason}），并成功接管会话。` +
         `\n⚠️ 如果那个进程当时正在跑回合，那一轮的工作会中断（会话日志会记为 interrupted）。`;
     } catch (e) {
-      report.message = `杀掉 PID ${holder.marker.child_pid} 之后仍无法接管：${e.message}`;
+      report.message = `杀掉 PID ${killTarget} 之后仍无法接管：${e.message}`;
     }
     return report;
   }
@@ -485,11 +498,20 @@ export class Conversation {
     runRecord.started_at = now();
     const before = gitStatus(this.cwd);
     let proc;
+    // ★ `busy` 必须在 ensureAlive **之前**置位。
+    //   否则"把进程拉起来"这段（spawn + initialize + resume，可能好几秒）是一个**裸奔窗口**：
+    //     ① reaper 看到 busy=false 且 lastUsedAt 还是上一轮的时刻（已过期），会把这个**刚拉起来**
+    //        的进程当空闲回收掉 → 紧接着 resume 就报"DSH 进程未运行"（test/cycle.mjs 实测抓到）；
+    //     ② 第二个 dsh_send 同样能通过 busy 检查，于是为同一会话再拉一个子进程 → 互相撞锁 + 泄漏。
+    this.busy = true;
+    this.lastUsedAt = now();
     try {
       proc = await this.ensureAlive();
     } catch (e) {
-      // 起不来（撞写锁 / 会话损坏）就别留一条永远 "running" 的幽灵记录。
+      // 起不来（撞写锁 / 会话损坏）就**必须放开 busy**，否则这个会话被永久占住；
+      // 同时别留一条永远 "running" 的幽灵记录。
       // 调用方这次拿到的是 isError、并没有 run_id，所以这里不写哨兵。
+      this.busy = false;
       runRecord.status = 'error';
       runRecord.ended_at = now();
       runRecord.error = e.message;
@@ -503,7 +525,6 @@ export class Conversation {
       };
       throw e;
     }
-    this.busy = true;
     this.currentTurn += 1;
     this.turnStartedAt = now();
     this.turnOutChars = 0;
@@ -1043,6 +1064,7 @@ export class Hub {
         this,
       );
       conv.proc = proc;
+      conv.lastChildPid = proc.pid;
       // ★ 新建会话的进程也要登记持有者 —— 走的是 Hub.create 这条独立路径，
       //   不登记的话 dsh_takeover 会把"本服务自己持有的会话"误判成 none 而拒绝抢占。
       writeMarker(res.sessionId, { childPid: proc.pid, cwd });
@@ -1136,8 +1158,11 @@ export class Hub {
           this.log.info(`[hub] 空闲回收会话 ${c.id} 的进程（可 resume 复活）`);
           const proc = c.proc;
           c.proc = null;
-          removeMarker(c.id);
+          // ★ 顺序要紧：**先确认子进程真的退出（写锁真的释放），再删登记**。
+          //   反过来的话，一旦它没死透，锁的持有者就变成"无登记的未知进程" ——
+          //   既报不清是谁，连 dsh_takeover 都会拒绝（判成 none）。
           await proc.stop().catch(() => {});
+          removeMarker(c.id);
         }
       } catch (e) {
         this.log.info(`[hub] 回收周期异常（已忽略，下个周期继续）: ${e.message}`);
