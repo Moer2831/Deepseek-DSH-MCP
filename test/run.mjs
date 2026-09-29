@@ -44,5 +44,9 @@ if (code === 0 && all) {
 if (code === 0 && all) {
   code = await run('reasoning-check.mjs');
 }
+// 收尾清理：只清临时目录里的测试残留（真实项目会话与仓库 .state/ 不动）。
+// 无论前面成败都跑，否则失败的运行会把垃圾留在磁盘上。
+await run('cleanup.mjs');
+
 console.log(`\n总结果: ${code === 0 ? '通过 ✅' : '失败 ❌'}`);
 process.exit(code);

@@ -250,7 +250,10 @@ node bin/dsh-mcp-workspaces.mjs --purge-test-sessions   # 删测试会话（规�
 ```bash
 node test/run.mjs          # 只跑冒烟（不消耗 token）
 node test/run.mjs --all    # 全量
+node test/cleanup.mjs      # 单独跑收尾清理（只针对临时目录；--dry-run 可预演）
 ```
+
+测试套件**会自己收尾**：`run.mjs` 结束时必定执行 `cleanup.mjs`，它只清理**系统临时目录里**的测试会话与工作区登记，**绝不动**真实项目里的会话，也不动仓库的 `.state/`（那是你实际使用 MCP 时的会话注册表与哨兵）。要连桌面 `dsh-mcp-test-*` 一起清，得显式跑 `node bin/dsh-mcp-workspaces.mjs --purge-test-sessions`。
 
 | 套件 | 检查数 | 覆盖 |
 |---|---|---|

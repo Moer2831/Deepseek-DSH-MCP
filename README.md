@@ -250,7 +250,10 @@ Silent by default — **not one byte is written**.
 ```bash
 node test/run.mjs          # smoke only (no LLM calls)
 node test/run.mjs --all    # everything
+node test/cleanup.mjs      # suite teardown on its own (temp dirs only; --dry-run to preview)
 ```
+
+The suite **cleans up after itself**: `run.mjs` always ends with `cleanup.mjs`, which removes test sessions and workspace registrations **inside the OS temp directory only**. Real project sessions and the repo's `.state/` (your live conversation registry and sentinels) are never touched. To also remove `Desktop\dsh-mcp-test-*` artifacts, run `node bin/dsh-mcp-workspaces.mjs --purge-test-sessions` explicitly.
 
 | Suite | Checks | Covers |
 |---|---|---|

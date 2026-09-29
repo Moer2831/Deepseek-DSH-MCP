@@ -247,12 +247,16 @@ export function backfillWorkspaces({ includeTemp = false, dryRun = false, pruneM
 /**
  * 删除测试会话（**这是唯一会动磁盘会话文件的函数**，所以规则写得很死）。
  *
- * 只会删这两类，其余一律不碰：
+ * 只会删这几类，其余一律不碰：
  *   1) 会话头里的 cwd 位于系统临时目录下
- *   2) 会话头里的 cwd 匹配 Desktop\dsh-mcp-test-*（本项目的验收测试目录）
- * 另外可用 ids 显式指定要删的会话 id。
+ *   2) 会话头里的 cwd 匹配 Desktop\dsh-mcp-test-* —— 传 tempOnly 可关掉这一条
+ *   3) ids 里显式指定的
+ *
+ * @param {object} opts
+ * @param {boolean} [opts.tempOnly] 只删临时目录下的。自动清理（测试套件收尾）用这条，
+ *   绝不动桌面或真实项目里的任何会话。
  */
-export function purgeTestSessions({ dryRun = false, ids = [] } = {}) {
+export function purgeTestSessions({ dryRun = false, ids = [], tempOnly = false } = {}) {
   const explicit = new Set(ids);
   const victims = [];
   if (existsSync(SESSIONS_ROOT)) {
@@ -271,7 +275,7 @@ export function purgeTestSessions({ dryRun = false, ids = [] } = {}) {
         if (!header?.id) continue;
         const cwd = header.cwd ?? '';
         const isTemp = isTempPath(cwd);
-        const isTestDesktop = /[\\/]Desktop[\\/]dsh-mcp-test-[AB]([\\/]|$)/i.test(cwd);
+        const isTestDesktop = !tempOnly && /[\\/]Desktop[\\/]dsh-mcp-test-[AB]([\\/]|$)/i.test(cwd);
         const isExplicit = explicit.has(header.id);
         if (!isTemp && !isTestDesktop && !isExplicit) continue;
         victims.push({
