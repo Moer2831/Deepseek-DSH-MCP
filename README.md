@@ -1,8 +1,12 @@
-# DeepSeek-DSH-MCP
+# 🐳 DeepSeek-DSH-MCP
 
 **English** | [中文](README.zh.md)
 
-An MCP server that lets **Claude Code / Codex / any MCP client** drive **DeepSeek Harness (DSH)** as a long-lived coding agent — start a conversation, hand it a goal, watch it work, interrupt it, come back later and collect the result.
+> **Give Claude Code / Codex a coding buddy that sticks around** — powered by DeepSeek Harness.
+
+An MCP server that drives DSH as a **long-lived agent runtime** instead of wrapping a CLI. Open a conversation, hand it a goal, and it writes code, runs scripts and spawns its own subagents — while you watch, cut in, and collect the result whenever you like. 🛠️
+
+🧪 265 checks green · 🔌 MCP over stdio · 📜 MIT
 
 > 📌 **Read the [Usage Notes](USAGE-NOTES.en.md) first** — the practical gotchas that will actually bite you: the ACP model-config trap, external MCP tools bypassing DSH's sandbox, the workspace/GUI registry cache, cost control, and a troubleshooting table.
 
@@ -16,7 +20,20 @@ Claude / Codex  ──MCP(stdio)──▶  dsh-mcp
                                     └─ dsh-mcp-client ─▶ your other MCP servers (e.g. IDA Pro)
 ```
 
-## Why this exists
+## ✨ Why it's different
+
+|  |  |
+|---|---|
+| 🔄 **A dead process never kills a conversation** | The identity lives on disk. A crash, an idle reap, even restarting this whole server costs you nothing — the next call transparently resumes it, memory intact (verified across processes). |
+| 🗣️ **You are never stuck waiting** | Steer a conversation mid-flight — **interject** to stop and redirect (~18 ms to converge), or **queue** a remark for after the current turn. Interrupting never damages the conversation. |
+| 📡 **Completion notification, not polling** | Long tasks return instantly with a `run_id`; when the turn ends, a **sentinel file** is written atomically so a background task in *your* host wakes you. No polling, no occupied turn. |
+| 🪟 **Many conversations at once** | `dsh_list(only_running)` shows what's live; `dsh_read` gives cursor-based incremental output. Cycle between them like windows. |
+| 🧠 **Reasoning hidden by default** | You get "thought for N chars / M seconds" statistics instead of context-burning prose — and it is never logged, never written to disk. |
+| 🤫 **Silent by default** | Not one byte on stderr, so nothing pollutes your host's logs. stdout carries the protocol and nothing else. |
+| 🧩 **Capabilities compose** | DSH can mount its own MCP servers (IDA Pro, browsers, your internal tooling), so this is a bridge to a whole toolbox. |
+| 🛡️ **Read-only that really is read-only** | `read-only` sandbox plus auto-denied approvals, for working on untrusted samples. |
+
+## ⚡ Why not just wrap the DSH CLI?
 
 DSH ships two programmable entry points. The `sdk` profile looks simpler, but its JSON-RPC surface has only **3 requests and 4 notifications** — and it lacks three things that make an agent unusable in practice. The `acp` profile (Agent Client Protocol) has all of them. Everything below was verified against DSH `0.1.7-rc.2`.
 
