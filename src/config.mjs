@@ -147,6 +147,15 @@ export const IDLE_TTL_MS = Number(process.env.DSH_MCP_IDLE_TTL_MS ?? 5 * 60 * 10
 /** 后台回收扫描间隔（毫秒）。 */
 export const REAP_INTERVAL_MS = Number(process.env.DSH_MCP_REAP_INTERVAL_MS ?? 30_000);
 
+/**
+ * `dsh_list` 的"磁盘探测"结果缓存多久（毫秒）。
+ *
+ * 为什么要缓存：列会话时要 spawn 一个 DSH 进程做 `session/list`（**实测约 1 秒**），
+ * 连着调几次就反复拉进程。缓存 10 秒既省掉这些开销，也不至于让"别的实例刚建的会话"久等。
+ * 想看实时结果可传 `include_closed=false`（只列本服务已打开的，毫秒级）。
+ */
+export const LIST_PROBE_TTL_MS = Number(process.env.DSH_MCP_LIST_PROBE_TTL_MS ?? 10_000);
+
 /** 权限档 → 该档下的默认审批策略。 */
 export const PERMISSION_TIERS = ['read-only', 'workspace-write', 'danger-full-access'];
 export const DEFAULT_PERMISSION = process.env.DSH_MCP_PERMISSION ?? 'danger-full-access';

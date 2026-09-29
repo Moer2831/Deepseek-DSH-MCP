@@ -43,6 +43,15 @@ if (code === 0 && all) {
   code = await run('lock.mjs');
 }
 if (code === 0 && all) {
+  code = await run('multi.mjs');
+}
+if (code === 0 && all) {
+  code = await run('list.mjs');
+}
+if (code === 0 && all) {
+  code = await run('permission.mjs');
+}
+if (code === 0 && all) {
   code = await run('cycle.mjs');
 }
 if (code === 0 && all) {

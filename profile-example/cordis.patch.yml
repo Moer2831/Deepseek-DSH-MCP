@@ -71,6 +71,16 @@
     model: my-model
 
 # ── 权限预设（本 MCP 服务按会话切换） ───────────────────────────────────────
+# ★ 这里**故意不写 `defaultPreset`** —— 这是实测踩到的坑，务必照抄：
+#   `dsh-permission-presets` 的 `defaultPreset` 会在**会话创建时**"applies it to the
+#   sandbox mode and approval policy"，从而**盖掉 dsh-base 从 `DSH_PERMISSION_MODE`
+#   推导出的模式**。一旦钉死 danger-full-access，调用方即使传 `permission: 'read-only'`
+#   拿到的也是完全权限 —— 无声提权。
+#   不写它时，插件使用"推断默认值"：按 sandbox + approval 的组合匹配下面的预设；而
+#   dsh-base 的组合规则是
+#       mode   = DSH_PERMISSION_MODE ?? 'workspace-write'
+#       policy = (mode === 'danger-full-access') ? 'never' : 'ask'
+#   正好与这三档一一对应 → **每个会话的真实权限档就由启动时传入的 env 决定**。
 - id: permission
   name: "@deepseek-ai/dsh-permission-presets"
   config:
@@ -84,7 +94,6 @@
       danger-full-access:
         sandbox: danger-full-access
         approval: never
-    defaultPreset: danger-full-access
 
 # ── 打开 LLM 生成会话标题（出厂在 acp 模板里是 disabled） ───────────────────
 - id: session-title-llm

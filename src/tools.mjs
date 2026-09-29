@@ -38,7 +38,10 @@ export const TOOL_DEFS = [
         permission: {
           type: 'string',
           enum: PERMISSION_TIERS,
-          description: `权限档。默认 ${DEFAULT_PERMISSION}。read-only 适合分析不信任样本（如恶意软件）；workspace-write 越界操作会冒泡为待决审批。`,
+          description:
+            `权限档。默认 ${DEFAULT_PERMISSION}。read-only 适合分析不信任样本（如恶意软件）；workspace-write 越界操作会冒泡为待决审批。` +
+            '**档位在创建时定下**：DSH 设计上"resume 的会话保留它自己记录的权限"，所以事后改这个参数不会改变已有会话，要换档需新建。' +
+            '（本档位是**真实生效**的 —— 由启动时传入的 env 决定，并有 test/permission.mjs 对着会话自己的记录逐档核验。）',
         },
         on_approval: {
           type: 'string',
@@ -104,8 +107,15 @@ export const TOOL_DEFS = [
       '想只看正在跑的，传 only_running=true；想看某个会话当前吐出的内容，接着用 dsh_read。',
     inputSchema: S({
       cwd: { type: 'string', description: '只看某个工作区下的会话。' },
-      include_closed: { type: 'boolean', description: '是否包含磁盘上未打开的会话，默认 true。' },
-      only_running: { type: 'boolean', description: '只返回正在跑回合的会话，默认 false。' },
+      include_closed: {
+        type: 'boolean',
+        description:
+          '是否包含磁盘上未打开的会话（含别的实例 / GUI 建的），默认 true。**代价：要 spawn 一个 DSH 进程去探测磁盘，实测约 1 秒**（结果缓存 10 秒）。只列本服务已打开的会话就传 false，毫秒级。',
+      },
+      only_running: {
+        type: 'boolean',
+        description: '只返回正在跑回合的会话，默认 false。**此模式自动跳过磁盘探测，毫秒级**（正在跑的会话必然在内存里）。',
+      },
     }),
   },
   {
@@ -361,7 +371,12 @@ export function createHandlers(hub) {
     },
 
     async dsh_list(args) {
-      let items = await hub.list({ cwd: args.cwd, includeClosed: args.include_closed !== false });
+      let items = await hub.list({
+        cwd: args.cwd,
+        // only_running 只关心"正在跑"的会话，而那些必然在本服务内存里 ——
+        // 磁盘探测（要 spawn 一个 DSH 进程，实测约 1 秒）对它是纯浪费，且语义等价。
+        includeClosed: args.only_running === true ? false : args.include_closed !== false,
+      });
       if (args.only_running === true) items = items.filter((c) => c.state === 'running');
       const running = items.filter((c) => c.state === 'running').length;
       const describe = (c) => {

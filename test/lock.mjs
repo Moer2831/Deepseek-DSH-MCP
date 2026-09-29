@@ -183,17 +183,19 @@ try {
   const ijS = ij?.structuredContent ?? {};
   check('★ dsh_interject 返回了 sentinel_file', !!ijS.sentinel_file, JSON.stringify(ijS).slice(0, 300));
   check('★ 插话那一轮的哨兵文件真的落盘了（旧实现这里永远为空等）', !!ijS.sentinel_file && existsSync(ijS.sentinel_file), String(ijS.sentinel_file));
-  if (ijS.sentinel_file && existsSync(ijS.sentinel_file)) {
-    const doc = JSON.parse(readFileSync(ijS.sentinel_file, 'utf8'));
-    check('哨兵内容 status=done', doc.status === 'done', JSON.stringify(doc.status));
-    check('哨兵里带正文', (doc.result?.answer ?? '').length > 0, JSON.stringify(doc.result?.answer?.slice(0, 80)));
-    check('哨兵里没有思考内容（隐私默认）', doc.result?.thinking === undefined, JSON.stringify(doc.result?.thinking)?.slice(0, 120));
-  }
+  // ⚠️ 下面几条**不能**包在 if 里：条件不满足时必须判失败，而不是静默不跑
+  //    （否则哨兵没落地时套件照样绿 —— 那是测试自己的逻辑陷阱）。
+  const ijDoc =
+    ijS.sentinel_file && existsSync(ijS.sentinel_file) ? JSON.parse(readFileSync(ijS.sentinel_file, 'utf8')) : null;
+  check('哨兵内容 status=done', ijDoc?.status === 'done', JSON.stringify(ijDoc?.status));
+  check('哨兵里带正文', (ijDoc?.result?.answer ?? '').length > 0, JSON.stringify(ijDoc?.result?.answer?.slice(0, 80)));
+  check(
+    '哨兵里没有思考内容（隐私默认）',
+    ijDoc !== null && ijDoc.result?.thinking === undefined,
+    JSON.stringify(ijDoc?.result?.thinking)?.slice(0, 120),
+  );
   const bgSent = bg?.structuredContent?.sentinel_file;
-  if (bgSent) {
-    // 后台那一轮的哨兵也应已落地（插话会等它跑完）
-    check('后台那一轮的哨兵也落地了', existsSync(bgSent), bgSent);
-  }
+  check('后台那一轮的哨兵也落地了', !!bgSent && existsSync(bgSent), String(bgSent));
 
   // ── [4] 抢占与状态的边界 ─────────────────────────────────────
   console.log('\n[4] 抢占与状态的边界情况');

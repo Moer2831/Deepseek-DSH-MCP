@@ -34,6 +34,8 @@ export function readConversationMeta(sessionId) {
       pressure: val('contextPressure'),
       model: model?.lastUsed,
       sandboxMode: val('sandboxMode'),
+      /** 会话自己的权限记录：`{preset, sandbox, approval, seeded}`。接管会话时必须尊重它。 */
+      permissions: val('permissions'),
       turns: val('sessionStats')?.turns,
     };
   } catch {

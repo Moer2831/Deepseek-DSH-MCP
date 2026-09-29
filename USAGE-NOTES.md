@@ -132,6 +132,19 @@
   - **锁被别人占着** → 报"写锁被占用"并告诉你是谁（见 §3.5）✓
 - **唯一会丢东西的情况**：**MCP 服务本身**崩了/被重启 —— 它拉起的子进程会一起退出，进行中的回合中断且**哨兵不会落地**。这时去核对工作区状态，别干等哨兵。
 
+### 3.9 ★★ 权限档的无声提权陷阱（最危险的一个坑）
+
+- **现象**：`dsh_start(permission: 'read-only')` **返回** `"read-only"`，但会话**实际跑的是完全权限**。调用方以为在沙箱里分析样本，其实没有。
+- **根因**：profile 里若写了 `defaultPreset`，`dsh-permission-presets` 会在**会话创建时**把它"应用到 sandbox 模式与审批策略"，
+  从而**盖掉** `dsh-base` 从 `DSH_PERMISSION_MODE` 推导出的模式。钉死 `danger-full-access` 就等于每会话都提权。
+- **正确写法**：profile 里**只定义预设、不要写 `defaultPreset`**。此时插件使用"推断默认值"（按 sandbox + approval 的组合去匹配预设），
+  而 `dsh-base` 的组合规则是 `mode = DSH_PERMISSION_MODE ?? 'workspace-write'`、`policy = (mode === 'danger-full-access') ? 'never' : 'ask'`，
+  正好与三档一一对应 → **每个会话的真实档位就由启动时传入的 env 决定**。`profile-example/cordis.patch.yml` 已是正确写法。
+- **怎么验证**：**别看工具的返回值**（那正是会说谎的地方），去读**会话自己记录的事实**（投影缓存里的 `permissions.preset` / `sandboxMode`）。
+  仓库里的 `test/permission.mjs` 就是这么做的，三档逐一核对且三档互不相同。
+- **另一个注意**：档位是在 **`dsh_start` 时定下的**。DSH 的设计是"**resume 的会话保留它自己记录的权限**"，
+  所以事后改 `permission` 参数**不会**改变已有会话 —— 要换档就新建会话。
+
 ## 四、权限与安全（认真看）
 
 ### 4.1 默认是"完全权限"

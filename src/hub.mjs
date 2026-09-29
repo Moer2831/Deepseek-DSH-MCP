@@ -30,6 +30,7 @@ import {
   DEFAULT_PERMISSION,
   DEFAULT_REASONING_EFFORT,
   IDLE_TTL_MS,
+  LIST_PROBE_TTL_MS,
   PERMISSION_TIERS,
   PROMPT_TIMEOUT_MS,
   REAP_INTERVAL_MS,
@@ -42,7 +43,7 @@ import {
 } from './config.mjs';
 import { AcpProcess } from './acp.mjs';
 import { readConversationMeta } from './titles.mjs';
-import { registerWorkspace } from './workspace.mjs';
+import { registerWorkspace, findSessionHeader } from './workspace.mjs';
 import {
   classifyHolder,
   describeLeaseConflict,
@@ -856,6 +857,8 @@ export class Hub {
   }
 
   #reaper;
+  /** `dsh_list` 磁盘探测的短缓存（探测要 spawn 一个 DSH 进程，实测约 1 秒）。 */
+  #probeCache = null;
 
   load() {
     if (!existsSync(STATE_FILE)) return;
@@ -871,6 +874,9 @@ export class Hub {
     }
   }
 
+  /** 原子保存。**tmp 名必须唯一**：多个 dsh-mcp 实例共用同一份注册表时，
+   * 固定名（`<STATE_FILE>.tmp`）会让并发保存互相踩踏 —— 先写的被后写的覆盖，
+   * rename 甚至可能发布出别人的内容或半截文件。哨兵那边早就是这么做的。 */
   save() {
     try {
       mkdirSync(dirname(STATE_FILE), { recursive: true });
@@ -879,7 +885,7 @@ export class Hub {
         savedAt: new Date().toISOString(),
         conversations: [...this.conversations.values()].map((c) => c.toState()),
       };
-      const tmp = `${STATE_FILE}.tmp`;
+      const tmp = `${STATE_FILE}.tmp.${process.pid}.${Math.random().toString(36).slice(2)}`;
       writeFileSync(tmp, JSON.stringify(doc, null, 2), 'utf8');
       renameSync(tmp, STATE_FILE);
     } catch (e) {
@@ -986,7 +992,40 @@ export class Hub {
       this.adoptNewFromDisk();
       c = this.conversations.get(id);
     }
-    if (!c) throw new Error(`未知会话: ${id}（用 dsh_list 查看可用会话）`);
+    if (!c) {
+      // 最后一道：注册表里没有，但会话可能就在磁盘上 —— 别的实例建的、注册表被并发写覆盖丢的、
+      // 或者根本是别的 profile / GUI 建的。**会话存储才是权威，注册表只是缓存。**
+      const header = findSessionHeader(id);
+      if (header?.cwd) {
+        // ★ 权限档必须取自**会话自己的记录**，不能一律套默认值：
+        //   一个当初用 read-only 建的会话，若注册表丢了、被我们以默认档接管，
+        //   resume 时 DSH_PERMISSION_MODE 会把档位写进会话 —— 等于**悄悄提权**。
+        const meta = readConversationMeta(id);
+        const recordedPreset = meta?.permissions?.preset;
+        const permission = PERMISSION_TIERS.includes(recordedPreset) ? recordedPreset : DEFAULT_PERMISSION;
+        const recordedApproval = meta?.permissions?.approval;
+        const onApproval = APPROVAL_POLICIES.includes(recordedApproval)
+          ? recordedApproval
+          : defaultApprovalPolicy(permission);
+        c = new Conversation(
+          {
+            id,
+            cwd: header.cwd,
+            permission,
+            onApproval,
+          },
+          this,
+        );
+        this.conversations.set(id, c);
+        this.save();
+        this.log.info(`[hub] 从会话存储吸收了 ${id}（注册表里没有，但磁盘上有；权限档沿用 ${permission}）`);
+      }
+    }
+    if (!c) {
+      throw new Error(
+        `未知会话: ${id}（用 dsh_list 查看可用会话；也可能是 id 写错了）`,
+      );
+    }
     return c;
   }
 
@@ -1105,38 +1144,52 @@ export class Hub {
     }
     if (!includeClosed) return [...out.values()];
 
+    // 磁盘探测要 spawn 一个 DSH 进程（实测约 1 秒），所以同 cwd 的结果缓存一小段时间，
+    // 避免"连着列几次会话"就反复拉进程。
+    const cacheKey = cwd ?? '';
+    const cached =
+      this.#probeCache && this.#probeCache.key === cacheKey && now() - this.#probeCache.at < LIST_PROBE_TTL_MS
+        ? this.#probeCache.sessions
+        : null;
+
     const probeCwd = cwd ?? [...this.conversations.values()][0]?.cwd ?? process.cwd();
-    let proc = null;
-    try {
-      proc = new AcpProcess({ cwd: probeCwd, permission: 'read-only' });
-      proc.start();
-      await proc.initialize();
-      const res = await proc.request('session/list', cwd ? { cwd } : {});
-      for (const s of res?.sessions ?? []) {
-        if (out.has(s.sessionId)) continue;
-        const meta = readConversationMeta(s.sessionId);
-        out.set(s.sessionId, {
-          conversation_id: s.sessionId,
-          title: meta?.title ?? null,
-          cwd: s.cwd,
-          permission: null,
-          alive: false,
-          busy: false,
-          /** 磁盘上有、但本服务当前没打开 → detached（可用 resume 复活）。 */
-          state: 'detached',
-          current_tool: null,
-          out_chars: 0,
-          running_ms: 0,
-          turns: meta?.turns ?? null,
-          usage: meta?.usage?.totals ?? null,
-          context_pressure: meta?.pressure ?? null,
-          model: meta?.model ?? null,
-        });
+    let sessions = cached;
+    if (!sessions) {
+      let proc = null;
+      try {
+        proc = new AcpProcess({ cwd: probeCwd, permission: 'read-only' });
+        proc.start();
+        await proc.initialize();
+        const res = await proc.request('session/list', cwd ? { cwd } : {});
+        sessions = res?.sessions ?? [];
+        this.#probeCache = { key: cacheKey, at: now(), sessions };
+      } catch (e) {
+        this.log.info(`[hub] session/list 探测失败: ${e.message}`);
+        sessions = []; // 失败不缓存，下次重试
+      } finally {
+        await proc?.stop().catch(() => {});
       }
-    } catch (e) {
-      this.log.info(`[hub] session/list 探测失败: ${e.message}`);
-    } finally {
-      await proc?.stop().catch(() => {});
+    }
+    for (const s of sessions) {
+      if (out.has(s.sessionId)) continue;
+      const meta = readConversationMeta(s.sessionId);
+      out.set(s.sessionId, {
+        conversation_id: s.sessionId,
+        title: meta?.title ?? null,
+        cwd: s.cwd,
+        permission: null,
+        alive: false,
+        busy: false,
+        /** 磁盘上有、但本服务当前没打开 → detached（可用 resume 复活）。 */
+        state: 'detached',
+        current_tool: null,
+        out_chars: 0,
+        running_ms: 0,
+        turns: meta?.turns ?? null,
+        usage: meta?.usage?.totals ?? null,
+        context_pressure: meta?.pressure ?? null,
+        model: meta?.model ?? null,
+      });
     }
     return [...out.values()];
   }

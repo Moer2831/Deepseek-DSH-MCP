@@ -6,7 +6,7 @@
 
 An MCP server that drives DSH as a **long-lived agent runtime** instead of wrapping a CLI. Open a conversation, hand it a goal, and it writes code, runs scripts and spawns its own subagents — while you watch, cut in, and collect the result whenever you like. 🛠️
 
-🧪 414 checks green · 🔌 MCP over stdio · 📜 MIT · 💬 Community: [linux.do](https://linux.do/)
+🧪 457 checks green · 🔌 MCP over stdio · 📜 MIT · 💬 Community: [linux.do](https://linux.do/)
 
 > 📌 **Read the [Usage Notes](USAGE-NOTES.en.md) first** — the practical gotchas that will actually bite you: the ACP model-config trap, external MCP tools bypassing DSH's sandbox, the workspace/GUI registry cache, cost control, and a troubleshooting table.
 
@@ -252,6 +252,9 @@ Silent by default — **not one byte is written**.
 | `DSH_MCP_PROFILE` | `dsh-mcp` | DSH profile to drive |
 | `DSH_MCP_STATE` | `<repo>/.state/conversations.json` | Conversation registry, survives restarts |
 | `DSH_MCP_RUNS_DIR` | `<state file dir>/runs` | Root for async completion sentinels (`<this>/<conversation_id>/<run_id>.json`) |
+| `DSH_MCP_LOCKS_DIR` | `<state file dir>/locks` | Holder registrations for the write lock. ⚠️ **All instances must agree on this value**, or they cannot see each other's registrations and will misread each other as an unidentifiable holder (a GUI) and refuse to preempt |
+| `DSH_MCP_LOCK_STALE_MS` | `90000` | How long without a heartbeat before a holder counts as lost (and becomes auto-preemptible by `dsh_takeover`) |
+| `DSH_MCP_LIST_PROBE_TTL_MS` | `10000` | Cache lifetime for `dsh_list`'s on-disk probe (the probe spawns a DSH process and takes ~1 s) |
 | `DSH_MCP_SENTINEL_TTL_MS` | `604800000` (7 days) | Startup pruning age for sentinels; `0` disables pruning |
 | `DSH_MCP_SENTINEL_INCLUDE_REASONING` | unset | `1` writes `result.thinking` into the sentinel (**breaks the never-on-disk guarantee**) |
 | `DSH_MCP_PERMISSION` | `danger-full-access` | Default tier for `dsh_start` |
@@ -289,7 +292,11 @@ The suite **cleans up after itself**: `run.mjs` always ends with `cleanup.mjs`, 
 | `workspace-effect` | 24 | workspace actually effective when no path is given |
 | `acceptance` | 36 | two folders × two conversations doing a read-only IDA Pro analysis |
 
-**Total: 414 checks, all green.** (378 in-suite + 36 acceptance)
+| `multi` | 19 | **several instances and non-ASCII paths**: reproduces "two instances share the registry and the later save drops the earlier instance's conversation", then proves **that conversation is recoverable by id alone from the session store and actually usable**; **recovery never silently escalates privileges** (a read-only conversation stays read-only); no `.tmp` residue; and **CJK / emoji workspace paths** create sessions, do real work, and place files in the right directory |
+| `permission` | 11 | ★ **whether the permission tiers actually take effect** (a safety property): it ignores our own return values (the very thing that used to lie) and reads **the session's own record** (`permissions.preset` / `sandboxMode` in the projection cache), checking all three tiers and that their recorded values differ. **This suite caught a silent privilege escalation**: a `defaultPreset` in the profile overrides `DSH_PERMISSION_MODE` at session creation |
+| `list` | 13 | **the cost of `dsh_list`** (measured): a default call with the on-disk probe takes ~1 s (it spawns a DSH process) while **repeated calls hit a cache and drop to single-digit milliseconds**; `only_running=true` and `include_closed=false` **skip the probe** with equivalent semantics (unopened on-disk sessions are simply excluded) |
+
+**Total: 457 checks, all green.** (421 in-suite + 36 acceptance)
 
 ## 🔒 The write lock: one writer per conversation at a time
 
@@ -308,6 +315,12 @@ A DSH session directory carries a **cross-process write lock** whose semantics a
 | `none` | no registration — **most likely your own DSH GUI has it open** | ❌ **never killed** (that would kill your whole UI, including the conversation you're reading), reported only |
 
 > **Crash vs. wedge (measured)**: `SIGKILL` the MCP server and its DSH children **exit with it** — their stdio is a pipe to the parent, so closing it gives them EOF and they shut down. **A crash therefore releases the lock automatically; it never leaves an orphan holding it** (a restart always gets it back). What `stale-mcp` really covers is "**the holder is alive but wedged**" (heartbeat expired) — that's the case worth preempting.
+
+### Several instances at once (you may keep more than one host window open)
+
+- **The registry is one document, last writer wins**: when instance B saves, it drops conversations it has never seen — including one instance A just created (reproduced in tests). **This does not break usage**: the service treats the **session store as authoritative and the registry as a cache**, so any session still on disk can be recovered **by id alone** and dispatched to normally.
+- **Holder registrations must be shared**: `DSH_MCP_LOCKS_DIR` has to point at the same directory (by default it follows `DSH_MCP_STATE`, so **the defaults are fine**). If you give each instance its own `DSH_MCP_STATE`, **point `DSH_MCP_LOCKS_DIR` at one shared directory explicitly** — otherwise instances cannot see each other's registrations and will misread each other as an unidentifiable holder (a GUI) and refuse to preempt.
+- **Recommendation**: unless you have a reason, **let every instance share the default `DSH_MCP_STATE`**.
 
 > **Operational rule**: don't open a conversation this server drives in your DSH GUI. To look at it there, `dsh_release` first; dispatch again afterwards (it resumes automatically).
 >

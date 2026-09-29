@@ -187,6 +187,26 @@ export function scanSessions() {
 }
 
 /**
+ * 按会话 id 在会话存储里找到它的头（跨所有分桶扫描）。
+ *
+ * 用于"注册表里没有、但会话其实在磁盘上"的场景：别的 dsh-mcp 实例建的、注册表被并发写覆盖丢的、
+ * 或者根本是别的 profile / GUI 建的。**会话存储才是权威，注册表只是缓存。**
+ *
+ * 会对 id 做形状校验（只允许 UUID / `session-` 前缀那类字符），避免 `..` 之类逃出会话目录。
+ */
+export function findSessionHeader(sessionId) {
+  if (typeof sessionId !== 'string' || !/^[A-Za-z0-9._-]{4,80}$/.test(sessionId)) return null;
+  if (!existsSync(SESSIONS_ROOT)) return null;
+  for (const bucket of readdirSync(SESSIONS_ROOT)) {
+    const f = join(SESSIONS_ROOT, bucket, sessionId, 'session.v4.jsonl.zstd');
+    if (!existsSync(f)) continue;
+    const header = readHeader(f);
+    if (header?.id === sessionId) return header;
+  }
+  return null;
+}
+
+/**
  * 回填：按磁盘上的会话头把所有工作区补登记一遍。
  * 用于修复"本功能上线前创建的会话在 GUI 里看不到"。
  */
