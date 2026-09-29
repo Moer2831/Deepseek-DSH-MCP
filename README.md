@@ -6,7 +6,7 @@
 
 An MCP server that drives DSH as a **long-lived agent runtime** instead of wrapping a CLI. Open a conversation, hand it a goal, and it writes code, runs scripts and spawns its own subagents — while you watch, cut in, and collect the result whenever you like. 🛠️
 
-🧪 503 checks green · 🔌 MCP over stdio · 📜 MIT · 💬 Community: [linux.do](https://linux.do/)
+🧪 504 checks green · 🔌 MCP over stdio · 📜 MIT · 💬 Community: [linux.do](https://linux.do/)
 
 > 📌 **Read the [Usage Notes](USAGE-NOTES.en.md) first** — the practical gotchas that will actually bite you: the ACP model-config trap, external MCP tools bypassing DSH's sandbox, the workspace/GUI registry cache, cost control, and a troubleshooting table.
 
@@ -295,7 +295,7 @@ The suite **cleans up after itself**: `run.mjs` always ends with `cleanup.mjs`, 
 | `async` | 16 | fire-and-forget + later collection |
 | `sentinel` | 36 | completion sentinel: atomicity, latch semantics, per-conversation namespacing under concurrency, cancelled runs still land it, and **reasoning never reaching the file** |
 | `prune` | 11 | **sentinel retention**: prunes over-age and crash-leftover files, keeps fresh ones, removes empty shells, `TTL=0` disables pruning, and never touches the conversation registry beside it (no tokens, runs every time) |
-| `guards` | 30 | **environment-variable guards**: odd numbers always land on the safe side — `IDLE_TTL_MS` values like `-1` or garbage mean "never reap" (never give the write lock away), a too-small reap interval falls back to the default (no busy loop), and the **lost-holder threshold is floored at 30 s** (so another instance cannot "legitimately" preempt and kill our turn) (no tokens, runs every time) |
+| `guards` | 31 | **environment-variable guards**: odd numbers always land on the safe side — `IDLE_TTL_MS` values like `-1` or garbage mean "never reap" (never give the write lock away), a too-small reap interval falls back to the default (no busy loop), and the **lost-holder threshold is floored at 30 s** (so another instance cannot "legitimately" preempt and kill our turn) (no tokens, runs every time) |
 | `timeout` | 38 | **timeout semantics**: `wait=false` is unaffected by `timeout_ms`; a `wait=true` expiry merely downgrades to background (turn not cancelled, result not lost, `busy` never lies); `timeout_ms<=0` waits forever; a failed resume invalidates the process instead of wedging the conversation; an empty prompt yields a clear error |
 | `lock` | 79 | **write lock and preemption**: four holder classifications, `writeMarker` never overwriting a live holder, malformed/missing registration edge cases; **end-to-end** with two real MCP instances fighting over one conversation → clear error → refusal → `force` takeover; **a crash releases the lock automatically**, **a wedged holder is preempted without `force`**; plus the "one turn, one sentinel" invariant (inline turns and idle interjects included) |
 | `cycle` | 36 | **the async dispatch lifecycle**: dispatch → collect the sentinel → idle reap → dispatch again, three rounds with no lock error; re-dispatch right on the reap boundary (widening the race); an immediate re-dispatch after `dsh_release`; and an assertion that reaping leaves no unattributable lock (this suite caught the reaper collecting a freshly spawned process as if it were idle) |
@@ -308,7 +308,7 @@ The suite **cleans up after itself**: `run.mjs` always ends with `cleanup.mjs`, 
 | `permission` | 11 | ★ **whether the permission tiers actually take effect** (a safety property): it ignores our own return values (the very thing that used to lie) and reads **the session's own record** (`permissions.preset` / `sandboxMode` in the projection cache), checking all three tiers and that their recorded values differ. **This suite caught a silent privilege escalation**: a `defaultPreset` in the profile overrides `DSH_PERMISSION_MODE` at session creation |
 | `list` | 13 | **the cost of `dsh_list`** (measured): a default call with the on-disk probe takes ~1 s (it spawns a DSH process) while **repeated calls hit a cache and drop to single-digit milliseconds**; `only_running=true` and `include_closed=false` **skip the probe** with equivalent semantics (unopened on-disk sessions are simply excluded) |
 
-**Total: 503 checks, all green.** (467 in-suite + 36 acceptance)
+**Total: 504 checks, all green.** (468 in-suite + 36 acceptance)
 
 ## 🔒 The write lock: one writer per conversation at a time
 
