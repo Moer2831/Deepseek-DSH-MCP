@@ -34,9 +34,9 @@ try {
 
   console.log('\n[2] tools/list');
   const tools = await client.listTools();
-  check(`工具数量 = 10（实际 ${tools.length}）`, tools.length === 10);
+  check(`工具数量 = 11（实际 ${tools.length}）`, tools.length === 11);
   const names = tools.map((t) => t.name);
-  for (const n of ['dsh_start', 'dsh_send', 'dsh_list', 'dsh_read', 'dsh_get', 'dsh_interject', 'dsh_interrupt', 'dsh_release', 'dsh_approval_decide', 'dsh_status']) {
+  for (const n of ['dsh_start', 'dsh_send', 'dsh_list', 'dsh_read', 'dsh_get', 'dsh_interject', 'dsh_interrupt', 'dsh_release', 'dsh_takeover', 'dsh_approval_decide', 'dsh_status']) {
     check(`含工具 ${n}`, names.includes(n));
   }
 

@@ -6,7 +6,7 @@
 
 An MCP server that drives DSH as a **long-lived agent runtime** instead of wrapping a CLI. Open a conversation, hand it a goal, and it writes code, runs scripts and spawns its own subagents — while you watch, cut in, and collect the result whenever you like. 🛠️
 
-🧪 299 checks green · 🔌 MCP over stdio · 📜 MIT · 💬 Community: [linux.do](https://linux.do/) 
+🧪 339 checks green · 🔌 MCP over stdio · 📜 MIT · 💬 Community: [linux.do](https://linux.do/)
 
 > 📌 **Read the [Usage Notes](USAGE-NOTES.en.md) first** — the practical gotchas that will actually bite you: the ACP model-config trap, external MCP tools bypassing DSH's sandbox, the workspace/GUI registry cache, cost control, and a troubleshooting table.
 
@@ -113,7 +113,8 @@ node test/smoke.mjs        # no LLM calls, verifies the whole plumbing
 | `dsh_list` | All conversations with live state: `running` / `idle` / `detached`, elapsed time, current tool, output so far. `only_running=true` for active ones |
 | `dsh_read` | **Cursor-based incremental read** of what a *running* conversation is producing right now |
 | `dsh_get` | Conversation details; with `run_id`, the **final result of that dispatch** (the "collect the result later" entry point) |
-| `dsh_interject` | Interject while it's busy: `interject` = stop and redirect, `queue` = wait for the current turn, then speak |
+| `dsh_interject` | Interject while it's busy: `interject` = stop and redirect, `queue` = wait for the current turn, then speak. **This round writes a sentinel too**, and the reply carries its `sentinel_file` |
+| `dsh_takeover` | **Preempt the write lock.** The only way out when another DSH process holds it (DSH has no steal API — preempting means killing the holder). It classifies the holder first: our own orphaned child → taken automatically; another live instance → needs `force`; **GUI/unknown → never killed**, reported instead |
 | `dsh_interrupt` | Stop the current turn (the conversation stays healthy) |
 | `dsh_release` | Hand the conversation back (frees the write lock so you can open it in your own DSH GUI). Still resumable |
 | `dsh_approval_decide` | Adjudicate a pending approval (only when `on_approval=ask`) |
@@ -279,13 +280,34 @@ The suite **cleans up after itself**: `run.mjs` always ends with `cleanup.mjs`, 
 | `integration` | 30 | resume-with-memory across processes, interrupt, both interject modes |
 | `async` | 16 | fire-and-forget + later collection |
 | `sentinel` | 36 | completion sentinel: atomicity, latch semantics, per-conversation namespacing under concurrency, cancelled runs still land it, and **reasoning never reaching the file** |
+| `lock` | 39 | **write lock and preemption**: lease-error detection, four holder classifications, orphan discovery; **end-to-end** with two real MCP instances fighting over one conversation → clear error → refusal → `force` takeover → usable afterwards; plus a regression proving **interject rounds write a sentinel** |
 | `timeout` | 34 | **timeout semantics**: `wait=false` is unaffected by `timeout_ms`; a `wait=true` expiry merely downgrades to background (turn not cancelled, result not lost, `busy` never lies); `timeout_ms=0` waits forever; a failed resume invalidates the process instead of wedging the conversation |
 | `concurrency` | 31 | three simultaneous conversations + live incremental reads |
 | `capability` | 22 | writing code, running scripts, **spawning its own subagents** (verified on disk via child session headers) |
 | `workspace-effect` | 24 | workspace actually effective when no path is given |
 | `acceptance` | 36 | two folders × two conversations doing a read-only IDA Pro analysis |
 
-**Total: 299 checks, all green.**
+**Total: 339 checks, all green.**
+
+## 🔒 The write lock: one writer per conversation at a time
+
+A DSH session directory carries a **cross-process write lock** whose semantics are "**the holder keeps it for as long as it lives**" — and there is **no API to take it from a live holder**. Two hard consequences:
+
+- This server keeps a DSH process alive per conversation (that's what makes resume work), so **while it holds one, your own DSH GUI cannot open that conversation** — and vice versa. The two are mutually exclusive.
+- On contention DSH throws `SessionAlreadyOwnedError`, which is **not** a standard JSON-RPC error, so ACP wraps it as a generic `-32603 "Internal error"` and hides the real cause in `error.data`. This server surfaces `data` and translates it into something actionable.
+
+**`dsh_status` reports who holds the lock** in its `lock_holder` field, and `dsh_takeover` acts on the four cases:
+
+| `lock_holder` | Meaning | Preemption |
+|---|---|---|
+| `self` | this process holds it | nothing to do |
+| `stale-mcp` | **our own leftover orphan** (the MCP died/restarted but its child still holds the lock) | ✅ **killed and taken over automatically** (safe) |
+| `live-mcp` | another **live** dsh-mcp instance is using it | ⚠️ refused by default; `force=true` takes it |
+| `none` | no registration — **most likely your own DSH GUI has it open** | ❌ **never killed** (that would kill your whole UI, including the conversation you're reading), reported only |
+
+> **Operational rule**: don't open a conversation this server drives in your DSH GUI. To look at it there, `dsh_release` first; dispatch again afterwards (it resumes automatically).
+>
+> Why the last row refuses: GUI conversations **run inside the `dsh web` process** (not one process per conversation), so "killing the lock holder" would take down the entire web service and every GUI conversation with it. Sessions on disk survive and can be resumed, but in-flight turns are lost.
 
 ## Known limitations
 

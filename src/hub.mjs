@@ -43,6 +43,15 @@ import {
 import { AcpProcess } from './acp.mjs';
 import { readConversationMeta } from './titles.mjs';
 import { registerWorkspace } from './workspace.mjs';
+import {
+  classifyHolder,
+  describeLeaseConflict,
+  heartbeat as lockHeartbeat,
+  isLeaseError,
+  killHolderChild,
+  removeMarker,
+  writeMarker,
+} from './locks.mjs';
 
 const now = () => Date.now();
 const NOOP_LOG = { info: () => {}, debug: () => {}, dshStderr: () => {} };
@@ -206,6 +215,8 @@ export class Conversation {
       usage: meta?.usage?.totals ?? null,
       context_pressure: meta?.pressure ?? null,
       pending_approvals: [...this.pendingApprovals.keys()],
+      /** 不在本进程手里时，写锁在谁手上（none=多半是你自己的 GUI / stale-mcp=可抢占的孤儿 / live-mcp=另一个实例）。 */
+      lock_holder: this.proc?.alive ? 'self' : classifyHolder(this.id).kind,
     };
   }
 
@@ -223,6 +234,8 @@ export class Conversation {
     });
     proc.start();
     this.proc = proc;
+    // 登记"我为这个会话拉起了哪个子进程" —— 抢锁时要靠它判断持有者是谁
+    writeMarker(this.id, { childPid: proc.pid, cwd: this.cwd });
     try {
       await proc.initialize();
       // 能走到这里说明本会话刚新建了一个 DSH 进程（Hub.create 之后进程一直活着，不会进这个分支），
@@ -247,8 +260,91 @@ export class Conversation {
       } catch {
         /* 已经死了就无所谓 */
       }
+      removeMarker(this.id);
+      // 写锁冲突是最常见也最需要"说人话"的失败：DSH 的 SessionAlreadyOwnedError 会被
+      // ACP 包成 -32603 "Internal error"，只说这句调用方根本不知道该怎么办。
+      if (isLeaseError(e.message)) {
+        const holder = classifyHolder(this.id);
+        const err = new Error(describeLeaseConflict(this.id, holder));
+        err.code = 'session-writer-held';
+        err.holder = holder;
+        throw err;
+      }
       throw new Error(`恢复会话失败（已作废该进程，下次调用会重建）：${e.message}`);
     }
+  }
+
+  /**
+   * 抢占写锁。
+   *
+   * 为什么需要"杀进程"：DSH 的写锁是跨进程内核信号量，**没有 API 能从活着的持有者手里夺走**。
+   * 所以抢锁 == 杀掉持有者，然后重新 resume。既然要杀，就必须先确认那是谁：
+   *
+   *   - `stale-mcp`（本服务自己实例的孤儿残留）→ **自动杀**，安全；
+   *   - `live-mcp`（另一个活着的 dsh-mcp 实例）→ 默认拒绝，`force=true` 才杀；
+   *   - `none`（没有登记，多半是你自己的 DSH GUI）→ **绝不杀**（会连你的界面和正在看的对话一起杀掉），只报告。
+   */
+  async takeover({ force = false } = {}) {
+    const report = { conversation_id: this.id, ok: false, holder_kind: null, killed_pid: null, message: '' };
+
+    if (this.proc?.alive) {
+      report.ok = true;
+      report.message = '本进程已经持有该会话，无需抢占。';
+      return report;
+    }
+
+    // 1) 先走正常路径：原持有者可能早已释放
+    try {
+      await this.ensureAlive();
+      report.ok = true;
+      report.message = '无需抢占：正常 resume 就成功了（锁是空的，原持有者已释放）。';
+      return report;
+    } catch (e) {
+      if (e.code !== 'session-writer-held') {
+        report.message = `不是写锁问题，抢占帮不上忙：${e.message}`;
+        return report;
+      }
+    }
+
+    // 2) 分类处置
+    const holder = classifyHolder(this.id);
+    report.holder_kind = holder.kind;
+    report.holder = holder.marker;
+
+    if (holder.kind === 'none' || !holder.childAlive) {
+      report.message =
+        `抢占未执行：${holder.reason}\n` +
+        '本服务**不会**杀非本服务拉起的进程（那可能是你的 DSH GUI，杀它会连你正在看的对话一起没）。\n' +
+        '请在那个窗口里关掉该会话（或切走），然后重试。';
+      return report;
+    }
+    if (holder.kind === 'live-mcp' && !force) {
+      report.message =
+        `抢占被拒绝：${holder.reason}\n` +
+        '如果确认那边已经不用它了，重试时带 force=true 强行夺过来。';
+      return report;
+    }
+
+    // 3) 杀 + 重试（内核在持有者进程退出时释放信号量）
+    const kill = killHolderChild(holder.marker.child_pid);
+    report.killed_pid = holder.marker.child_pid;
+    report.kill = kill;
+    if (!kill.killed) {
+      report.message = `抢占失败：${kill.reason}`;
+      return report;
+    }
+    removeMarker(this.id, { force: true });
+    await new Promise((r) => setTimeout(r, 500)); // 给内核一点时间回收锁
+    try {
+      await this.ensureAlive();
+      report.ok = true;
+      report.message =
+        `已抢占：杀掉持有者 PID ${holder.marker.child_pid}（${holder.reason}），并成功接管会话。` +
+        `\n⚠️ 如果那个进程当时正在跑回合，那一轮的工作会中断（会话日志会记为 interrupted）。`;
+    } catch (e) {
+      report.message = `杀掉 PID ${holder.marker.child_pid} 之后仍无法接管：${e.message}`;
+    }
+    return report;
   }
 
   // ── 流式更新收集 ────────────────────────────────────────────────
@@ -373,10 +469,7 @@ export class Conversation {
    *
    * @returns 等到回合结束 → 完整 result；没等到（wait=false 或等超时）→ 收据对象
    */
-  async prompt(
-    text,
-    { reasoning = 'hide', timeoutMs = PROMPT_TIMEOUT_MS, run, wait = true, sentinel = false } = {},
-  ) {
+  async prompt(text, { reasoning = 'hide', timeoutMs = PROMPT_TIMEOUT_MS, run, wait = true } = {}) {
     if (this.busy) {
       throw new Error(
         `会话 ${this.id} 正在跑另一个回合。可以：dsh_interject 插话（打断并改口 / 排队），或 dsh_interrupt 打断。`,
@@ -407,8 +500,6 @@ export class Conversation {
     this.collector = c;
     const t0 = now();
     let settled = false;
-    /** 调用方不会在原地等结果（fire-and-forget，或 wait=true 等超时转后台）→ 需要落哨兵通知它。 */
-    let backgrounded = sentinel || !wait;
 
     /** 回合真正结束时收尾。无论有没有人在等，都**只执行一次**。 */
     const finalize = (stopReason, failure) => {
@@ -453,7 +544,11 @@ export class Conversation {
       runRecord.elapsed_ms = result.elapsed_ms;
       runRecord.status = failure ? 'error' : stopReason === 'cancelled' ? 'cancelled' : 'done';
       runRecord.result = result;
-      if (backgrounded) this.#hub.writeRunSentinel(this.id, runRecord);
+      // ★ 无条件写哨兵：**一个回合 = 一个哨兵文件**，没有例外。
+      //   之前只在"调用方没在原地等"时才写，于是插话那一轮没有哨兵 —— 调用方的
+      //   等待逻辑（等文件出现）就永远空等，即使 run 早已 status=done（真实事故）。
+      //   统一规则也消除了整类"有 run_id 却没有哨兵"的坑。
+      this.#hub.writeRunSentinel(this.id, runRecord);
       return result;
     };
 
@@ -494,10 +589,7 @@ export class Conversation {
       ),
       new Promise((r) => setTimeout(() => r(true), timeoutMs)),
     ]);
-    if (timedOut && !settled) {
-      backgrounded = true; // 之后的 finalize 会写哨兵
-      return receipt(timeoutMs);
-    }
+    if (timedOut && !settled) return receipt(timeoutMs);
     return runRecord.result;
   }
 
@@ -644,6 +736,8 @@ export class Conversation {
       } catch {}
       await proc.stop();
     }
+    // 进程没了 → 写锁也释放了，登记必须跟着删（否则会把"孤儿持有者"误报给抢占逻辑）
+    removeMarker(this.id);
     if (forget) this.#hub.remove(this.id);
     else this.#hub.save();
     return { closed: true, forgotten: forget };
@@ -812,9 +906,38 @@ export class Hub {
   }
 
   get(id) {
-    const c = this.conversations.get(id);
+    let c = this.conversations.get(id);
+    if (!c) {
+      // 多实例常见情形：这个会话是**另一个 dsh-mcp 实例**刚建的，我们内存里的注册表还没有。
+      // 先吸收一次磁盘状态再判定 —— 否则会把"别人的会话"误报成"未知会话"，用户一头雾水。
+      this.adoptNewFromDisk();
+      c = this.conversations.get(id);
+    }
     if (!c) throw new Error(`未知会话: ${id}（用 dsh_list 查看可用会话）`);
     return c;
+  }
+
+  /**
+   * 只吸收磁盘上"本进程还没有的"会话（多实例场景）。
+   * **绝不覆盖**内存里已有的会话 —— 那会把活进程引用与回合状态一起丢掉。
+   * @returns {number} 新吸收的数量
+   */
+  adoptNewFromDisk() {
+    if (!existsSync(STATE_FILE)) return 0;
+    let added = 0;
+    try {
+      const doc = JSON.parse(readFileSync(STATE_FILE, 'utf8'));
+      for (const s of doc.conversations ?? []) {
+        if (!s?.id || !s?.cwd) continue;
+        if (this.conversations.has(s.id)) continue;
+        this.conversations.set(s.id, new Conversation(s, this));
+        added++;
+      }
+      if (added) this.log.info(`[hub] 从磁盘吸收了 ${added} 个别的实例新建的会话`);
+    } catch (e) {
+      this.log.info(`[hub] 吸收磁盘会话失败: ${e.message}`);
+    }
+    return added;
   }
 
   remove(id) {
@@ -868,6 +991,9 @@ export class Hub {
         this,
       );
       conv.proc = proc;
+      // ★ 新建会话的进程也要登记持有者 —— 走的是 Hub.create 这条独立路径，
+      //   不登记的话 dsh_takeover 会把"本服务自己持有的会话"误判成 none 而拒绝抢占。
+      writeMarker(res.sessionId, { childPid: proc.pid, cwd });
       proc.attachRoutes({
         onNotification: (params) => conv.onUpdate(params),
         onPermissionRequest: (params) => conv.onPermissionRequest(params),
@@ -941,10 +1067,14 @@ export class Hub {
       const cutoff = now() - IDLE_TTL_MS;
       for (const c of this.conversations.values()) {
         if (c.busy || !c.proc?.alive) continue;
+        // 还握着写锁的会话要续心跳：否则别的实例会把"活着但一时空闲"的我们
+        // 误判成卡死，进而去抢占我们持有的会话。
+        lockHeartbeat(c.id);
         if (c.lastUsedAt > cutoff) continue;
         this.log.info(`[hub] 空闲回收会话 ${c.id} 的进程（可 resume 复活）`);
         const proc = c.proc;
         c.proc = null;
+        removeMarker(c.id);
         await proc.stop().catch(() => {});
       }
     }, REAP_INTERVAL_MS);
@@ -958,6 +1088,8 @@ export class Hub {
       const proc = c.proc;
       c.proc = null;
       await proc?.stop().catch(() => {});
+      // 子进程停了，锁就释放了；登记也要删，否则下个实例会把我们看成"孤儿持有者"
+      removeMarker(c.id);
     }
     this.save();
   }

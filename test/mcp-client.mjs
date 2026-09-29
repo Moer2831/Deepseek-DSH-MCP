@@ -38,6 +38,11 @@ export class McpClient {
     return this;
   }
 
+  /** 服务端进程 PID（测试用：模拟"MCP 崩了但它的 DSH 子进程还活着"需要单独杀掉它）。 */
+  get pid() {
+    return this.#child?.pid ?? null;
+  }
+
   #onData(chunk) {
     this.#buf += chunk.toString('utf8');
     let i;

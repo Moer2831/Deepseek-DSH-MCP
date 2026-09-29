@@ -6,7 +6,7 @@
 
 一个 MCP 服务端：把 DSH 当作**长驻的 agent 运行时**来驱动，而不是包一层命令行。开个会话、扔个目标，它自己写代码、跑脚本、派子代理；你随时能看、能插话、能回头验收。🛠️
 
-🧪 299 项检查全绿 · 🔌 MCP over stdio · 📜 MIT · 💬 开发社区 [linux.do](https://linux.do/)
+🧪 339 项检查全绿 · 🔌 MCP over stdio · 📜 MIT · 💬 开发社区 [linux.do](https://linux.do/)
 
 > 📌 **建议先读 [使用注意事项](USAGE-NOTES.md)** —— 会真正踩到的坑：ACP 模型配置陷阱、**外部 MCP 工具的副作用不受 DSH 沙箱约束**、工作区与 GUI 的注册表缓存、成本控制、以及一张故障速查表。
 
@@ -113,7 +113,8 @@ node test/smoke.mjs        # 不调用 LLM，验证整条管道
 | `dsh_list` | 所有会话及运行状态：`running` / `idle` / `detached`，已跑时长、当前工具、本轮输出。`only_running=true` 只看活动会话 |
 | `dsh_read` | **游标式增量读**——看正在跑的会话此刻吐出了什么 |
 | `dsh_get` | 会话详情；带 `run_id` 时返回**那一次派活的完整结果**（"回头验收"的入口） |
-| `dsh_interject` | 会话在忙时插话：`interject` 打断并改口，`queue` 等本轮跑完接着说 |
+| `dsh_interject` | 会话在忙时插话：`interject` 打断并改口，`queue` 等本轮跑完接着说。**这一轮同样会写哨兵**，返回里给 `sentinel_file` |
+| `dsh_takeover` | **抢占写锁**。锁被别的 DSH 进程占着时的唯一出路（DSH 没有夺锁 API，抢 = 杀掉持有者）。先判定持有者：本服务残留的孤儿 → 自动抢；另一个活着的实例 → 需 `force`；**GUI/未知 → 绝不杀**，只报告 |
 | `dsh_interrupt` | 打断当前回合（会话不会损坏） |
 | `dsh_release` | 交还会话（释放写锁，之后可在你自己的 DSH GUI 里打开）。仍可 resume |
 | `dsh_approval_decide` | 裁决待决审批（仅当 `on_approval=ask`） |
@@ -279,13 +280,34 @@ node test/cleanup.mjs      # 单独跑收尾清理（只针对临时目录；--d
 | `integration` | 30 | 跨进程 resume 与记忆、中断、两种插话 |
 | `async` | 16 | fire-and-forget + 事后验收 |
 | `sentinel` | 36 | 完成哨兵：原子性、闩锁语义、多会话并发不串台、被取消也落地、**思考不进文件** |
+| `lock` | 39 | **写锁与抢占**：锁错误识别、四类持有者判定、孤儿列举；**端到端**用两个真实 MCP 实例抢同一会话 → 清晰报错 → 拒绝 → `force` 抢占成功 → 接管后可用；以及**插话那一轮也写哨兵**的回归 |
 | `timeout` | 34 | **超时语义**：`wait=false` 不受 `timeout_ms` 影响、`wait=true` 到期只转后台（不取消/不丢结果、`busy` 不说谎）、`timeout_ms=0` 一直等、resume 失败会作废进程而不永久卡死 |
 | `concurrency` | 31 | 三会话并发 + 实时增量读 |
 | `capability` | 22 | 写代码、跑脚本、**自行派子代理**（用磁盘上的子会话头验证） |
 | `workspace-effect` | 24 | 不给路径时工作区是否真的生效 |
 | `acceptance` | 36 | 两个文件夹 × 两个会话做只读 IDA Pro 分析 |
 
-**合计 299 项检查，全绿。**
+**合计 339 项检查，全绿。**
+
+## 🔒 写锁：一个会话同一时刻只能有一个写者
+
+DSH 的会话目录有**跨进程写锁**，语义是「**持有者活着就永不过期**」，而且**没有 API 能从活的持有者手里夺走**。这带来两条硬约束：
+
+- 本服务为"保持对话"让一个 DSH 进程常驻 → 期间**你自己的 DSH GUI 打不开这个会话**；反过来，你在 GUI 里开着的会话，本服务也动不了。**两边互斥。**
+- 撞上时 DSH 会抛 `SessionAlreadyOwnedError`，但它**不是** JSON-RPC 的标准错误，会被 ACP 包装成笼统的 `-32603 "Internal error"`，真实原因藏在 `error.data` 里。本服务会把 `data` 取出来，翻译成人话并给出可执行动作。
+
+**`dsh_status` 的 `lock_holder` 字段告诉你锁在谁手上**，`dsh_takeover` 按四类分别处置：
+
+| `lock_holder` | 含义 | 抢占行为 |
+|---|---|---|
+| `self` | 本进程持有 | 无需抢占 |
+| `stale-mcp` | **本服务自己留下的孤儿**（MCP 崩了/重启了，子进程还活着握着锁） | ✅ **自动杀掉并接管**（安全） |
+| `live-mcp` | 另一个**活着**的 dsh-mcp 实例在用 | ⚠️ 默认拒绝，`force=true` 才夺 |
+| `none` | 无登记 —— **多半是你自己的 DSH GUI 正开着它** | ❌ **绝不杀**（那会把你的整个界面、连同正在看的对话一起杀掉），只报告 |
+
+> **操作铁律**：本服务驱动的会话**不要在 DSH GUI 里打开**。要用 GUI 看，先 `dsh_release` 交还；看完再重派（会自动 resume）。
+>
+> 补充说明：GUI 的会话**跑在 `dsh web` 那个进程里**（不是一会话一进程），所以"杀掉占锁的 GUI"= 杀掉整个 web 服务 = 所有 GUI 会话一起断（磁盘上的会话可 resume，但进行中的回合会丢）。这就是上表最后一行宁可拒绝的原因。
 
 ## 已知限制
 

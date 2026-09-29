@@ -23,26 +23,43 @@ DSH 自己有文件读写、shell、搜索、技能、子代理等全套工具�
 
 【标准流程】
 1. dsh_start(cwd, ...)                        建会话。cwd 必须是**已存在**的绝对路径。
-2. dsh_send(conversation_id, prompt)          派活。默认阻塞到回合结束并返回答复。
-   dsh_send(..., wait=false) → run_id         长任务用这个：立刻返回，你继续干别的。
+2. dsh_send(conversation_id, prompt)          **默认不阻塞**：立刻返回 run_id + sentinel_file。
+                                              想原地等结果才传 wait=true。
 3. 之后按需：
-   dsh_status(conversation_id)                还在跑吗？跑到哪了？
+   dsh_status(conversation_id)                还在跑吗？跑到哪了？写锁在谁手上？
    dsh_read(conversation_id, cursor)          中途看它当前吐出的内容（增量）
    dsh_get(conversation_id, run_id)           验收：取那一次派活的完整结果
 4. dsh_interject / dsh_interrupt              跑偏了就插话改口 / 直接打断
 5. dsh_release                                交还会话（释放写锁，之后仍可 resume）
+6. dsh_takeover                               写锁被别人占着时的**抢占**（见下）
+
+【写锁：一个会话同一时刻只能有一个写者】
+DSH 的会话目录有跨进程写锁，**持有者活着就永不过期，且没有 API 能直接夺走**。所以：
+- 本服务为"保持对话"让一个 DSH 进程常驻 → 期间**用户自己的 DSH GUI 打不开这个会话**，反之亦然。
+- 撞上 "session ... is already owned by an active write handle"（可能被 ACP 包装成笼统的
+  "Internal error"）时**不要盲目重试**：先 dsh_status 看 lock_holder 字段，它会是：
+    self / stale-mcp（本服务自己的孤儿，可安全抢占）/ live-mcp（另一个 dsh-mcp 实例）/
+    none（多半是你自己的 GUI 正开着它）
+- 要拿回写锁：
+  · stale-mcp → dsh_takeover 直接抢占（会自动杀掉那个孤儿子进程）；
+  · live-mcp → 先在那边 dsh_release；确实要夺再 dsh_takeover(force=true)；
+  · none（GUI 持有）→ 本服务**绝不杀**（那会把用户的整个界面连同正在看的对话一起杀掉）。
+    请用户在那个窗口里关掉该会话后重试，或重启 dsh web。
+- 操作铁律：**本服务驱动的会话不要在 DSH GUI 里打开**；要用 GUI 看，先 dsh_release 交还。
 
 【异步完成：跑完自动通知，别傻等也别狂轮询】
-wait=false 会立刻返回 run_id 和 **sentinel_file**（一个文件路径）。回合结束时——无论成功、失败还是被取消——
-本服务都会**原子写出**这个文件，内容含该 run 的最终 result 与 status。于是你有三种收活姿势：
+**每一个回合结束时都会原子写出一个哨兵文件**（无论成功、失败、被取消；也无论是 dsh_send 还是
+dsh_interject —— 一个回合 = 一个哨兵，没有例外）。dsh_send 的返回里直接给 sentinel_file；
+若某次调用没给，路径就是 状态目录/runs/<conversation_id>/<run_id>.json 。三种收活姿势：
 - **首选（真·跑完通知，不占轮次）**：用你自己的后台任务等这个文件出现。文件一到，宿主就唤醒你，
-  你再读文件即得结果。示例（Bash，注意把 Windows 路径的盘符写成 /d/… 、反斜杠改成正斜杠）：
-    sent='/d/AI_MCP/DSH_MCP/.state/runs/<conversation_id>/<run_id>.json'
+  你再读文件即得结果。示例（Bash；直接用返回里的 sentinel_file_posix，别手工转换路径）：
+    sent="$sentinel_file_posix"
     dl=$(( $(date +%s)+2100 )); until [ -f "$sent" ]; do [ $(date +%s) -ge $dl ] && { echo TIMEOUT; exit 1; }; sleep 2; done; echo DONE
   读文件即可拿到 status 和 result；**不受内存窗口限制、也扛本服务重启**。文件里 status=error 表示失败。
-- 想阻塞拿结果、且预计几分钟内完成 → 干脆 **wait=true**，结果直接在返回里，连文件都不用。
-- 临时查一下 → dsh_get(conversation_id, run_id) 取结果 / dsh_status 看是否在跑 / dsh_read 看增量输出。
-本服务**不会**主动给你发 MCP 通知（协议上只应答请求）；"跑完通知"就是靠上面这个哨兵文件 + 你的后台等待任务实现的。
+- 想阻塞拿结果 → 传 **wait=true**；即使等超时也不会丢结果：返回会变成收据（still_running + sentinel_file），
+  回合继续跑，结果照常由哨兵送达。
+- 临时查一下 → dsh_get(conversation_id, run_id) / dsh_status / dsh_read。
+本服务**不会**主动给你发 MCP 通知（协议上只应答请求）；"跑完通知"就是靠哨兵文件 + 你的后台等待任务实现的。
 **多会话并发安全**：哨兵路径按 conversation_id 分目录，不同会话的 run 各写各的、不串台；每个 run 起一个独立的
 等待任务即可，各自完成、各自唤醒你。哨兵是一次性闩锁：即便 run 在你启动等待任务之前就已完成，[ -f ] 也会立刻为真。
 

@@ -53,7 +53,13 @@ try {
   // 脏输入：塞一行非 JSON，随后的正常请求必须仍然可用
   client.notify('this is not json at all', {});
   const afterGarbage = await client.request('tools/list', {});
-  check('收到脏行后连接仍可用', (afterGarbage?.tools ?? []).length === 10, `tools=${afterGarbage?.tools?.length}`);
+  // 断言"仍然可用"就够了 —— 不要写死工具数量，否则加一个工具就要改一处（这里曾经写过 10）
+  const garbageTools = afterGarbage?.tools ?? [];
+  check(
+    '收到脏行后连接仍可用',
+    garbageTools.length > 0 && garbageTools.some((t) => t.name === 'dsh_send'),
+    `tools=${garbageTools.length}`,
+  );
 
   const noArgs = await client.callTool('dsh_start', {});
   check('dsh_start 缺 cwd → isError', isErr(noArgs), txt(noArgs).slice(0, 120));

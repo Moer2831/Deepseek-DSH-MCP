@@ -15,6 +15,7 @@ import {
   REASONING_MODES,
   toPosixPath,
 } from './config.mjs';
+import { listOrphans } from './locks.mjs';
 
 const S = (props, required = []) => ({ type: 'object', properties: props, required, additionalProperties: false });
 
@@ -174,6 +175,28 @@ export const TOOL_DEFS = [
     inputSchema: S({ conversation_id: CONV_ID }, ['conversation_id']),
   },
   {
+    name: 'dsh_takeover',
+    description:
+      '**抢占会话的写锁**（DSH 的写锁是跨进程内核信号量，持有者活着就不过期，没有 API 能直接夺走——' +
+      '唯一手段是杀掉持有者进程，所以本工具会先判定持有者是谁）：' +
+      '① 若锁其实空着，正常 resume 即可，不会杀任何东西；' +
+      '② 若持有者是**本服务自己留下的孤儿进程**（MCP 崩了/重启了，子进程还活着握着锁）→ **自动杀掉并接管**，安全；' +
+      '③ 若持有者是**另一个活着的 dsh-mcp 实例** → 默认拒绝，传 force=true 才夺；' +
+      '④ 若持有者无法识别（**多半是你自己的 DSH GUI 正开着这个会话**）→ **绝不杀**（那会连你的界面和正在看的对话一起杀掉），' +
+      '只报告，请你在那个窗口里关掉该会话后重试。' +
+      '注意：杀掉正在跑回合的持有者会中断那一轮（会话日志记为 interrupted），会话本体不受损。',
+    inputSchema: S(
+      {
+        conversation_id: CONV_ID,
+        force: {
+          type: 'boolean',
+          description: '仅用于"另一个活着的 dsh-mcp 实例持有"这一种情况；对 GUI/未知持有者无效（永远不杀）。',
+        },
+      },
+      ['conversation_id'],
+    ),
+  },
+  {
     name: 'dsh_release',
     description:
       '释放会话占用的 DSH 进程（释放写锁，让用户能在自己的 DSH GUI 里打开同一个会话）。' +
@@ -325,7 +348,7 @@ export function createHandlers(hub) {
         // prompt() 自己负责收尾与写哨兵（sentinel: true）。这里 await 是为了
         // **同步暴露 resume/启动失败** —— 否则调用方会拿到一个 accepted 但注定失败的收据。
         // 冷启动时这一步要几秒（要拉进程 + resume），热会话是瞬时。
-        const res = await conv.prompt(args.prompt, { ...opts, run, wait: false, sentinel: true });
+        const res = await conv.prompt(args.prompt, { ...opts, run, wait: false });
         conv.lastResult = res;
         return res.still_running ? backgroundReceipt(hub, conv, res) : { structured: res, text: renderSendResult(res) };
       }
@@ -363,7 +386,18 @@ export function createHandlers(hub) {
       const text = items.length
         ? `${items.length} 个会话（其中 ${running} 个正在跑）：\n${items.map(describe).join('\n')}`
         : '(没有会话)';
-      return { structured: { count: items.length, running, conversations: items }, text };
+      // 孤儿锁持有者：上一代 MCP 崩了但它的 DSH 子进程还活着握着写锁 —— 不主动报出来，
+      // 用户只会在下一次撞上"被占用"时才发现。这里顺手提示，并给出可执行的动作。
+      const orphans = listOrphans();
+      const orphanNote = orphans.length
+        ? `\n\n⚠️ 发现 ${orphans.length} 个**孤儿锁持有者**（MCP 已退出、子进程还握着写锁）：\n` +
+          orphans.map((o) => `- 会话 ${o.conversation_id}（子进程 PID ${o.child_pid}，已失联 ${o.age_ms === null ? '未知' : Math.round(o.age_ms / 1000) + 's'}）`).join('\n') +
+          '\n→ 用 dsh_takeover 抢占即可（这些是本服务自己的残留，抢占是安全的）。'
+        : '';
+      return {
+        structured: { count: items.length, running, conversations: items, orphan_holders: orphans },
+        text: text + orphanNote,
+      };
     },
 
     async dsh_read(args) {
@@ -450,7 +484,17 @@ export function createHandlers(hub) {
           : r.interjected === 'queue'
             ? `已排队：等了 ${(r.waited_ms / 1000).toFixed(1)}s 让上一轮跑完，然后说了这句。`
             : `已打断上一轮，改口说了这句（上一轮耗时 ${(r.waited_ms / 1000).toFixed(1)}s 处被打断）。`;
-      return { structured: r, text: `${head}\n\n${renderSendResult(r)}` };
+      // 插话这一轮同样会写哨兵（"一个回合 = 一个哨兵"），把路径一并交回，
+      // 调用方就能用同一套"等文件出现"的逻辑收活 —— 之前这里没有哨兵，等待方会空等。
+      const sentinel = r?.run_id ? hub.runSentinelPath(conv.id, r.run_id) : null;
+      return {
+        structured: sentinel ? { ...r, sentinel_file: sentinel, sentinel_file_posix: toPosixPath(sentinel) } : r,
+        text:
+          `${head}\n\n${renderSendResult(r)}` +
+          (sentinel
+            ? `\n\n完成通知文件（本轮结束时原子写出，含最终结果）：\n  ${sentinel}\n  ${toPosixPath(sentinel)}`
+            : ''),
+      };
     },
 
     async dsh_interrupt(args) {
@@ -468,6 +512,12 @@ export function createHandlers(hub) {
           ? '已释放进程并从注册表移除。会话日志仍在磁盘上。'
           : '已释放 DSH 进程（写锁已让出，你可以在自己的 DSH GUI 里打开这个会话）。会话仍可 resume。',
       };
+    },
+
+    async dsh_takeover(args) {
+      const conv = hub.get(args.conversation_id);
+      const r = await conv.takeover({ force: args.force === true });
+      return { structured: r, text: `${r.ok ? '✅' : '❌'} ${r.message}` };
     },
 
     async dsh_approval_decide(args) {
@@ -488,6 +538,16 @@ export function createHandlers(hub) {
       }
       if (run) bits.push(`最近回合=${run.run_id}(${run.status})`);
       bits.push(`待决审批=${snap.pending_approvals.length}`);
+      // 写锁在谁手上：区分"自己握着"和"被别人占着"，后者直接给出可执行动作
+      if (snap.lock_holder && snap.lock_holder !== 'self') {
+        const hint =
+          snap.lock_holder === 'stale-mcp'
+            ? '（本服务残留的孤儿，可 dsh_takeover 抢占）'
+            : snap.lock_holder === 'live-mcp'
+              ? '（另一个活着的 dsh-mcp 实例在用；要夺需 dsh_takeover(force=true)）'
+              : '（多半是你自己的 DSH GUI 正开着它；本服务不会去杀，请在那窗口里关掉）';
+        bits.push(`写锁=${snap.lock_holder}${hint}`);
+      }
       return {
         structured: {
           conversation_id: snap.conversation_id,
@@ -499,6 +559,7 @@ export function createHandlers(hub) {
           running_ms: snap.running_ms,
           pending_approvals: snap.pending_approvals,
           turns: snap.turns,
+          lock_holder: snap.lock_holder,
           run: run
             ? {
                 run_id: run.run_id,

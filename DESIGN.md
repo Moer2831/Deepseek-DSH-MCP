@@ -229,6 +229,7 @@ Profile = `~/.dsh/profiles/<name>/`，由 `package.json` 的 `dsh.profile.bundle
 | B7 | 回合排队 | 同会话内串行排队（DSH 单会话单回合），避免并发踩踏 |
 | B8 | 上下文注入 | `contentBlocks` 支持文本与图片；支持 DSH 的 `@路径` 引用语法把文件带进会话 |
 | B9 | 异步完成哨兵 | `wait=false` 的 run 终止（done/error/cancelled）时，往 `<RUNS_DIR>/<conversation_id>/<run_id>.json` 原子写出含 `status`+`result` 的文件；调用方（Claude/Codex）用后台任务 `until [ -f ]` 等它出现即被唤醒，无需轮询、也不占轮次 |
+| B10 | 写锁抢占 | 写锁是跨进程内核信号量（持有者活着不过期、**无夺锁 API**），所以"抢"= 杀掉持有者。本服务登记自己拉起的子进程（`<状态目录>/locks/<会话id>.json`：pid + token + 心跳），据此把持有者分成四类，只对**判定为本服务残留的孤儿**自动动手；无法识别的一律不杀（见下） |
 
 **B9 设计要点（并发正确性）**：本服务在 MCP 协议上只应答请求、**不主动推通知**，"跑完通知"由哨兵文件 + 调用方后台等待任务共同实现。
 - **按会话分目录**：`run_id` 序号是每会话独立计数的，不同会话可能同毫秒生成同名 `run_id`；`<conversation_id>/` 前缀使其各写各的、不串台。会话内 `dsh_send` 忙时直接拒绝、序号单调，故会话内唯一。
@@ -240,7 +241,17 @@ Profile = `~/.dsh/profiles/<name>/`，由 `package.json` 的 `dsh.profile.bundle
 - **给调用方的便利**：返回值同时给出 `sentinel_file_posix`（`D:\a\b` → `/d/a/b`）。手工转换 Windows 路径是等待任务白等到超时最常见的原因。
 - **落点**：`tools.dsh_send` 的 `wait=false` 分支在 `.then`/`.catch` 各调一次 `hub.writeRunSentinel()`（覆盖所有终止态）；`createRun` 起跑前 `clearRunSentinel()` 防御历史残留。
 
-### C. 输出与思考控制（用户点名要的"默认隐藏思考内容"）
+**B10 设计要点（写锁与抢占）**
+- **为什么需要**：DSH 的 `SessionWriteLease` 是 Windows 命名内核信号量，**持有者活着就永不过期**，且**没有 API 能从活进程手里夺走** —— 唯一手段是杀掉持有者进程。既然要杀，就必须先判定那是谁。
+- **登记**：一个会话一个文件 `<状态目录>/locks/<会话id>.json`，内容 `{mcp_pid, mcp_token, child_pid, cwd, spawned_at, heartbeat_at}`。`mcp_token` 防 PID 复用；`heartbeat_at` 由 reaper 周期刷新。
+- **四类判定**（`locks.classifyHolder`）：`self`（自己）/ `stale-mcp`（MCP 已死或心跳过期 → 可安全抢占的孤儿）/ `live-mcp`（另一活着的实例）/ `none`（无登记，多半是用户的 GUI）。
+- **不覆盖原则**：`writeMarker` **绝不覆盖"别人还活着的"登记**。否则一次注定失败的 resume 会先把线索盖掉、再在失败路径删掉，抢占逻辑就把持有者误判成 `none`（实现期真实踩到）。
+- **两条独立 spawn 路径都要登记**：`ensureAlive()` **和** `Hub.create()` —— 新建会话走后者，漏登记会让"本服务自己持有的会话"被判成 `none` 而拒绝抢占（同样真实踩到）。
+- **错误翻译**：`SessionAlreadyOwnedError` 不是 `RequestError`，ACP 把它包成 `-32603 "Internal error"` 并把真实原因放 `error.data`；本服务取出 `data`，识别 `already owned` / `writer-held` / 中文「已被占用」，转成"谁持有 + 该怎么办"。
+- **绝不杀 GUI**：GUI 会话跑在 `dsh web` 单进程内（非一会话一进程），杀它 = 整个界面 + 该进程全部 GUI 会话一起断。因此 `none` 分支只报告不动手。
+- **多实例可见性**：`Hub.get()` 命中不到时先 `adoptNewFromDisk()`（只增补、不覆盖内存中的活会话），否则"另一个实例刚建的会话"会被误报成「未知会话」。
+
+## C. 输出与思考控制（用户点名要的"默认隐藏思考内容"）
 
 | # | 功能 | 说明 |
 |---|---|---|
@@ -333,6 +344,7 @@ Profile = `~/.dsh/profiles/<name>/`，由 `package.json` 的 `dsh.profile.bundle
 | `dsh_rename` | `conversation_id, alias` | `{id, native_title, alias}` |
 | `dsh_resume` | `conversation_id, permission?` | ⚠️ 见 A5，SDK 下不可行；退化为"新建 + 注入旧 transcript" |
 | `dsh_release` | `conversation_id, delete?` | `{released, deleted}` |
+| `dsh_takeover` | `conversation_id, force?` | `{ok, holder_kind, killed_pid, message}` —— 四类持有者分别处置（见 B10） |
 | `dsh_delete` | `conversation_id, confirm` | `{deleted}` |
 | `dsh_search` | `query, cwd?, limit?` | `[{id, title, seq, snippet}]` |
 

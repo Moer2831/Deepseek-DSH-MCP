@@ -52,6 +52,11 @@ export class AcpProcess {
     return this.#child !== null && this.#child.exitCode === null && !this.#stopping;
   }
 
+  /** 子进程 PID（供写锁登记使用）；未启动或已退出时为 null。 */
+  get pid() {
+    return this.#child?.pid ?? null;
+  }
+
   /** DSH stderr 的内存尾部（诊断用；默认不打印、不落盘）。 */
   get stderrTail() {
     return this.#stderrTail.join('\n');
