@@ -324,6 +324,14 @@ A DSH session directory carries a **cross-process write lock** whose semantics a
 
 > **Operational rule**: don't open a conversation this server drives in your DSH GUI. To look at it there, `dsh_release` first; dispatch again afterwards (it resumes automatically).
 >
+> **★ Why "just opening it" is not safe either (measured A/B)**: the lease really is "held while the holder lives", and **reading content or listing directories is unaffected** — but **clicking a conversation open in the GUI itself** takes a write handle, so **`dsh web` walks away with the lock**. Measured: with the conversation only in the MCP's hands the probe reports **free**; the moment you open it in the web UI it becomes **held: "already owned by an active write handle"**.
+>
+> **★★ And navigating away does not give it back (also measured)**: after you switch to another conversation the lock is **still** held by `dsh web`. In other words, **opening it once hands that conversation to the GUI for the whole lifetime of the web process**; the MCP cannot touch it again until you **restart `dsh web`**. (That explains "the caller can never get back in after a task": it is not taken every time — it is taken once and stays taken.)
+>
+> **So to watch progress use `dsh_read` (the MCP tool, with cursor-based incremental reads) or wait for the sentinel file — not the GUI.** If you really want the GUI view, `dsh_release` first (note that this interrupts a running turn, so it only fits the gaps between tasks).
+>
+> The consequence is precisely "**the task is running, you peek at progress in the web UI, and afterwards the caller cannot get back in**" — the old error wrapping surfaced that as a content-free `Internal error`; the new one names the holder as most likely your own GUI and tells you to close it and retry.
+>
 > Why the last row refuses: GUI conversations **run inside the `dsh web` process** (not one process per conversation), so "killing the lock holder" would take down the entire web service and every GUI conversation with it. Sessions on disk survive and can be resumed, but in-flight turns are lost.
 
 ## Known limitations

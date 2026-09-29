@@ -104,7 +104,7 @@ Codex / Claude  ──MCP(stdio)──▶  dsh-mcp（我们写）
 | 项目 key | 工作目录转义而来，如 `--D-AI_MCP-DSH_MCP--` |
 | 物理格式 | **多帧拼接 zstd**，每帧是一批已压缩的 JSONL 记录（实测 295KB 文件 = 189 帧 / 1.04MB 明文 / 349 条记录） |
 | 首帧 | `{"type":"session", version, id, createdAt, cwd, isSeeded, delegationDepth, agentPreset}` |
-| **并行写锁** | `SessionWriteLease`：POSIX `flock` / **Windows 命名内核信号量**，持有者活着就**永不过期**，争用抛 `SessionAlreadyOwnedError`。**读者不受影响。** |
+| **并行写锁** | `SessionWriteLease`：POSIX `flock` / **Windows 命名内核信号量**，持有者活着就**永不过期**，争用抛 `SessionAlreadyOwnedError`。**读内容/搜索/列目录不受影响**；但注意 ★**实测**：在 GUI 里"打开"一个会话这个动作本身就要为可写取句柄 → **会占锁**（见 B10）。 |
 | 投影缓存 | `.dsh\storages\session_projcache\sessions\<id>.json` → `record.rows.title.val`（标题）、`sandboxMode`、`tokenUsage`、`contextPressure`；每 200 事件或 5 秒写一次 |
 | 工作区注册表 | `.dsh\storages\workspace.json` → `workspaces[id] = {path, title, sessionIds, createdAt, updatedAt}` + `pinnedSessionIds` / `archivedSessionIds` |
 
@@ -249,6 +249,9 @@ Profile = `~/.dsh/profiles/<name>/`，由 `package.json` 的 `dsh.profile.bundle
 - **不覆盖原则**：`writeMarker` **绝不覆盖"别人还活着的"登记**（额外一层保险）；`removeMarker` 默认只删自己的（校验 token）。
 - **★ 崩溃不会留孤儿（实测结论）**：子进程的 stdio 是连着父进程的管道，`SIGKILL` MCP → 管道关闭 → 子进程见 EOF 自杀 → **锁自动释放**。所以 `stale-mcp` 真正对应的是"**持有者活着但卡死**"（心跳过期），而不是"崩溃残留"。（代价：崩溃时进行中的回合会中断且**哨兵不会落地**，只能靠核对工作区状态。）
 - **两条独立 spawn 路径都要登记**：`ensureAlive()` **和** `Hub.create()` —— 新建会话走后者，漏登记会让"本服务自己持有的会话"被判成 `none` 而拒绝抢占（同样真实踩到）。
+- **★★ "在 GUI 里看进度"会抢走写锁（A/B 实测）**：用一个独立进程去 `session/resume` 探测同一会话 —— 会话只在 MCP 手里时**【空】**（连测两次）；用户在 web 里**点开**它之后**【被占用】**（`already owned by an active write handle`），且当时唯一的 MCP 服务**没有任何子进程**，持有者就是 `dsh web` 进程（它为此拉起 `--profile dsh-mcp` 助手）。结论：**"读"不受影响，但"打开"这个动作会占锁**。
+  → 这正是"任务跑完后调用方接不回去"的典型成因（旧代码还会把它包成 `Internal error`）。所以运行中的回合**不要在 GUI 里点进去看**；要看先 `dsh_release`。
+  → **★ 而且"切走"不会还回来（同样实测）**：你切到别的会话之后再探测，锁**仍然**被 `dsh web` 持有。**点开一次 = 这个会话在整个 web 进程生命周期内归 GUI**，MCP 要等重启 `dsh web` 才能再碰它。这才是"**总是**接不回去"的原因（不是每次都被抢，而是抢一次就长期生效）。看进度应该用 `dsh_read`。
 - **多实例共存（实测）**：多个实例共用一份注册表时 `save()` 是"整份文档、最后写入者获胜" —— 后保存的会把**它没见过**的会话从文件里抹掉（`test/multi.mjs` 复现）。因此**注册表只当缓存**：`Hub.get(id)` 查不到时用 `findSessionHeader(id)` 从**会话存储**按 id 接回来（跨分桶扫会话头），权限档取自**会话自己的记录**（`permissions.preset`），所以"只有 id"也足以驱动任何磁盘上存在的会话，且**不会提权**。另：`save()` 的临时文件必须**唯一命名**（pid + 随机），否则多实例并发保存会互相踩踏（写死 `${STATE_FILE}.tmp` 是真实 bug）。
 - **★★ 权限档的无声提权（最严重的一个，`test/permission.mjs` 守着）**：profile 里写 `defaultPreset` 会让 `dsh-permission-presets` 在**会话创建时**把它应用到 sandbox 模式与审批策略，**盖掉** `dsh-base` 从 `DSH_PERMISSION_MODE` 推导的模式 —— 于是 `dsh_start(permission:'read-only')` 返回 read-only 而会话实为完全权限。**正确写法：只定义预设、不写 `defaultPreset`**（插件改用"按 sandbox+approval 组合推断"的默认值，正好与三档一一对应）。**验证方式很关键**：不读工具的返回值（那正是会说谎的地方），而读**会话自己记录的事实**（投影缓存 `permissions.preset` / `sandboxMode`）。附带结论：档位在 `dsh_start` 时定下，DSH 设计上**resume 会保留会话已记录的权限**，事后改参数不生效。
 - **错误翻译**：`SessionAlreadyOwnedError` 不是 `RequestError`，ACP 把它包成 `-32603 "Internal error"` 并把真实原因放 `error.data`；本服务取出 `data`，识别 `already owned` / `writer-held` / 中文「已被占用」，转成"谁持有 + 该怎么办"。
