@@ -4,6 +4,8 @@
 
 An MCP server that lets **Claude Code / Codex / any MCP client** drive **DeepSeek Harness (DSH)** as a long-lived coding agent — start a conversation, hand it a goal, watch it work, interrupt it, come back later and collect the result.
 
+> 📌 **Read the [Usage Notes](USAGE-NOTES.en.md) first** — the practical gotchas that will actually bite you: the ACP model-config trap, external MCP tools bypassing DSH's sandbox, the workspace/GUI registry cache, cost control, and a troubleshooting table.
+
 ```
 Claude / Codex  ──MCP(stdio)──▶  dsh-mcp
                                     │ newline-delimited JSON-RPC (ACP)

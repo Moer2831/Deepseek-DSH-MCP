@@ -4,6 +4,8 @@
 
 一个 MCP 服务，让 **Claude Code / Codex / 任何 MCP 客户端**把 **DeepSeek Harness (DSH)** 当成一个**可长期共事的编码 agent** 来驱动 —— 开一个会话、给它目标、看它干活、中途插话打断、过一会儿再回来验收。
 
+> 📌 **建议先读 [使用注意事项](USAGE-NOTES.md)** —— 会真正踩到的坑：ACP 模型配置陷阱、**外部 MCP 工具的副作用不受 DSH 沙箱约束**、工作区与 GUI 的注册表缓存、成本控制、以及一张故障速查表。
+
 ```
 Claude / Codex  ──MCP(stdio)──▶  dsh-mcp
                                     │ 换行分隔 JSON-RPC（ACP）
