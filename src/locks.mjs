@@ -29,7 +29,7 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync, rmSync, readdirSync, renameSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { STATE_FILE, REAP_INTERVAL_MS } from './config.mjs';
+import { STATE_FILE, REAP_INTERVAL_MS, numEnv } from './config.mjs';
 
 /** 每个 MCP 进程一个身份串（防 PID 复用误判）。 */
 export const MCP_TOKEN = randomUUID();
@@ -41,7 +41,7 @@ export const MCP_TOKEN = randomUUID();
  *   立刻显示为"过期"，于是别的实例会**合法地抢占并杀掉我们的子进程** ✗ —— 这是
  *   最不能靠"用户猜对语义"的一个开关，所以把奇怪输入统一压到安全侧。
  */
-const rawStale = Number(process.env.DSH_MCP_LOCK_STALE_MS ?? 3 * REAP_INTERVAL_MS);
+const rawStale = numEnv('DSH_MCP_LOCK_STALE_MS', 3 * REAP_INTERVAL_MS);
 export const STALE_MS = Number.isFinite(rawStale) && rawStale >= 30_000 ? rawStale : Math.max(30_000, 3 * REAP_INTERVAL_MS);
 
 export const LOCKS_DIR = process.env.DSH_MCP_LOCKS_DIR ?? join(dirname(STATE_FILE), 'locks');

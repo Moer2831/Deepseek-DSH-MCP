@@ -136,10 +136,10 @@ export function toPosixPath(p) {
  *
  * 另注：`dsh_send` **默认 `wait=false`**，压根不走等待路径，这个值通常用不上。
  */
-export const PROMPT_TIMEOUT_MS = Number(process.env.DSH_MCP_PROMPT_TIMEOUT_MS ?? 0);
+export const PROMPT_TIMEOUT_MS = numEnv('DSH_MCP_PROMPT_TIMEOUT_MS', 0);
 
 /** 普通 ACP 请求的超时（毫秒）。 */
-export const REQUEST_TIMEOUT_MS = Number(process.env.DSH_MCP_REQUEST_TIMEOUT_MS ?? 60_000);
+export const REQUEST_TIMEOUT_MS = numEnv('DSH_MCP_REQUEST_TIMEOUT_MS', 60_000);
 
 /**
  * 会话空闲多久后回收其 DSH 进程（毫秒）。
@@ -155,7 +155,22 @@ export const REQUEST_TIMEOUT_MS = Number(process.env.DSH_MCP_REQUEST_TIMEOUT_MS 
  *   想省内存就设成毫秒数（如 `300000` = 5 分钟），但那就回到了"锁可能被 GUI 抢走"的世界。
  *   （无论哪种模式，锁心跳都会一直续 —— 否则别的实例会误判我们卡死并抢占。）
  */
-const rawIdle = Number(process.env.DSH_MCP_IDLE_TTL_MS ?? 0);
+/**
+ * 读一个数值型环境变量。**空串/纯空白一律当作"未设置"→ 用默认值**。
+ *
+ * 为什么必须这样：`.env` 与各种配置界面很容易产出空串（`DSH_MCP_MAX_LIVE=`），
+ * 而 `Number('')` 是 **0** —— 于是"我什么都没设"会被读成"我要 0"，
+ * 而 0 在这些开关里往往是个**有含义的极值**（0 = 不限 / 永不回收）✗。
+ * 这类"看起来没配、行为却变了"的坑最难查，所以统一在这里挡掉。
+ */
+export function numEnv(name, fallback) {
+  const raw = process.env[name];
+  if (raw === undefined || String(raw).trim() === '') return fallback;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+const rawIdle = numEnv('DSH_MCP_IDLE_TTL_MS', 0);
 /** ★ `<= 0` 或非法值一律当作"永不回收"。
  *  否则 `-1` 会被算成 `cutoff = now + 1` → **立刻回收**（谁会想到负数=马上收 ✗），
  *  `NaN` 更糟：比较永远为假，行为取决于具体分支。宁可把"奇怪的输入"统一压到安全侧。 */
@@ -163,7 +178,7 @@ export const IDLE_TTL_MS = Number.isFinite(rawIdle) && rawIdle > 0 ? rawIdle : 0
 
 /** 后台回收扫描间隔（毫秒）。**下限 200 毫秒**：0/负数会变成空转的紧循环 ✗（还会把心跳刷爆）。
  *  下限留得比较低，是为了让测试能把间隔调小去观察心跳与回收时序。 */
-const rawReap = Number(process.env.DSH_MCP_REAP_INTERVAL_MS ?? 30_000);
+const rawReap = numEnv('DSH_MCP_REAP_INTERVAL_MS', 30_000);
 export const REAP_INTERVAL_MS = Number.isFinite(rawReap) && rawReap >= 200 ? rawReap : 30_000;
 
 /**
@@ -171,12 +186,16 @@ export const REAP_INTERVAL_MS = Number.isFinite(rawReap) && rawReap >= 200 ? raw
  *
  * 为什么需要它：`IDLE_TTL_MS=0`（永不回收）能保证"GUI 抢不走写锁"，但代价是
  * **每个用过的会话永久占一个 DSH 子进程** —— 实测约 120MB/个（线性），10 个就 ~1.2GB ✗。
- * 设了本值之后，超过上限时**回收最久没用过的那个**（busy 的绝不回收）：
+ * 超过上限时**回收最久没用过的那个**（busy 的绝不回收）：
  *   - 保活窗口内的会话：写锁在手，GUI 抢不走 ✓
- *   - 窗口外的：进程回收、内存释放 ✓（下次派活自动 resume ✓）
- * 即"**内存有界，锁尽量在手**"。建议值：8（≈1GB）；内存紧就 4，机器大就 0（不限）。
+ *   - 窗口外的：进程回收、内存释放 ✓（下次派活自动 resume，无损 ✓）
+ * 即"**内存有界，锁尽量在手**"。
+ *
+ * **默认 8**（≈1GB）：让"内存有界"成为默认行为，而不是要用户先发现再配 ✗。
+ * 被回收是无损的（会话日志在磁盘上 ✓），代价只是那个会话的写锁会空出来、
+ * 且下次派活要 cold start。想做更多并行就调大；机器大也可以设 0（不限）。
  */
-const rawMaxLive = Number(process.env.DSH_MCP_MAX_LIVE ?? 0);
+const rawMaxLive = numEnv('DSH_MCP_MAX_LIVE', 8);
 export const MAX_LIVE = Number.isFinite(rawMaxLive) && rawMaxLive > 0 ? Math.floor(rawMaxLive) : 0;
 
 /**
@@ -186,7 +205,7 @@ export const MAX_LIVE = Number.isFinite(rawMaxLive) && rawMaxLive > 0 ? Math.flo
  * 连着调几次就反复拉进程。缓存 10 秒既省掉这些开销，也不至于让"别的实例刚建的会话"久等。
  * 想看实时结果可传 `include_closed=false`（只列本服务已打开的，毫秒级）。
  */
-export const LIST_PROBE_TTL_MS = Number(process.env.DSH_MCP_LIST_PROBE_TTL_MS ?? 10_000);
+export const LIST_PROBE_TTL_MS = numEnv('DSH_MCP_LIST_PROBE_TTL_MS', 10_000);
 
 /** 权限档 → 该档下的默认审批策略。 */
 export const PERMISSION_TIERS = ['read-only', 'workspace-write', 'danger-full-access'];
