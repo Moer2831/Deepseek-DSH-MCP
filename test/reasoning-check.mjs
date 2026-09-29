@@ -23,7 +23,7 @@ try {
     '要求：先写出你的推理过程（列方程、逐步求解），最后一行只写答案。';
 
   console.log('\n--- reasoning=hide ---');
-  const r1 = await client.callTool('dsh_send', { conversation_id: id, prompt, reasoning: 'hide' }, 300_000);
+  const r1 = await client.callTool('dsh_send', { conversation_id: id, prompt, wait: true, reasoning: 'hide' }, 300_000);
   const s1 = r1?.structuredContent ?? {};
   console.log('thinking_stats:', JSON.stringify(s1.thinking_stats));
   console.log('structured.thinking 是否为空:', JSON.stringify(s1.thinking ?? ''));
@@ -32,7 +32,7 @@ try {
   console.log('\n--- reasoning=full（同一会话追问，逼出第二段思考）---');
   const r2 = await client.callTool(
     'dsh_send',
-    { conversation_id: id, prompt: '再算一遍：如果头变成 50、脚变成 140，鸡兔各几只？同样先推理再给答案。', reasoning: 'full' },
+    { conversation_id: id, prompt: '再算一遍：如果头变成 50、脚变成 140，鸡兔各几只？同样先推理再给答案。', wait: true, reasoning: 'full' },
     300_000,
   );
   const s2 = r2?.structuredContent ?? {};

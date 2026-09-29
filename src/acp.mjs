@@ -116,8 +116,24 @@ export class AcpProcess {
       if (!p) return;
       this.#pending.delete(msg.id);
       clearTimeout(p.timer);
-      if (msg.error) p.reject(new Error(msg.error.message ?? JSON.stringify(msg.error)));
-      else p.resolve(msg.result);
+      if (msg.error) {
+        // ⚠️ 必须带上 error.data：ACP 把**非 RequestError 的异常**统一包成
+        // {code:-32603, message:"Internal error", data:{...真实原因...}}。
+        // 只取 message 的话，真实原因会被丢掉，只剩一句无用的 "Internal error"。
+        const d = msg.error.data;
+        let extra = '';
+        if (d !== undefined && d !== null) {
+          let s;
+          try {
+            s = typeof d === 'string' ? d : JSON.stringify(d);
+          } catch {
+            s = String(d);
+          }
+          if (s && s !== '{}') extra = ` | data=${s.length > 800 ? `${s.slice(0, 800)}…` : s}`;
+        }
+        const code = msg.error.code !== undefined ? `[${msg.error.code}] ` : '';
+        p.reject(new Error(`${code}${msg.error.message ?? JSON.stringify(msg.error)}${extra}`));
+      } else p.resolve(msg.result);
       return;
     }
     if (msg.method !== undefined && msg.id !== undefined) {
@@ -156,14 +172,23 @@ export class AcpProcess {
     return true;
   }
 
-  /** 发一个请求并等结果。 */
+  /**
+   * 发一个请求并等结果。
+   *
+   * `timeoutMs <= 0` = **不设超时**。这是给"长回合"用的：等待与否应该由上层按
+   * `wait` 语义决定，绝不该在这里把请求掐断 —— 本地放弃并不会让 agent 停下来，
+   * 只会让我们丢掉结果、误判回合结束（进而让 reaper 杀掉正在干活的进程）。
+   */
   request(method, params, timeoutMs = REQUEST_TIMEOUT_MS) {
     if (!this.alive) return Promise.reject(new Error('DSH 进程未运行'));
     const id = this.#nextId++;
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        if (this.#pending.delete(id)) reject(new Error(`ACP 请求超时: ${method}`));
-      }, timeoutMs);
+      const timer =
+        timeoutMs > 0
+          ? setTimeout(() => {
+              if (this.#pending.delete(id)) reject(new Error(`ACP 请求超时: ${method}`));
+            }, timeoutMs)
+          : null;
       this.#pending.set(id, { resolve, reject, timer });
       this.#write({ jsonrpc: '2.0', id, method, params });
     });

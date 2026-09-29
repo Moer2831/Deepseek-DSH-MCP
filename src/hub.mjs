@@ -223,19 +223,32 @@ export class Conversation {
     });
     proc.start();
     this.proc = proc;
-    await proc.initialize();
-    // 能走到这里说明本会话刚新建了一个 DSH 进程（Hub.create 之后进程一直活着，不会进这个分支），
-    // 而会话本体已经存在于磁盘上，所以必须 resume 把它接回来。
-    await proc.request('session/resume', {
-      sessionId: this.id,
-      cwd: this.cwd,
-      mcpServers: [],
-    });
-    // 新进程不记得会话级配置（思考深度/模型），resume 后必须重套
-    this.lastConfigApplied = await applySessionConfig(proc, this.id, this.cfg);
-    for (const f of this.lastConfigApplied.failed) this.#hub.log.info(`[conv ${this.id}] ${f}`);
-    this.#hub.log.info(`[conv ${this.id}] 已 resume`);
-    return proc;
+    try {
+      await proc.initialize();
+      // 能走到这里说明本会话刚新建了一个 DSH 进程（Hub.create 之后进程一直活着，不会进这个分支），
+      // 而会话本体已经存在于磁盘上，所以必须 resume 把它接回来。
+      await proc.request('session/resume', {
+        sessionId: this.id,
+        cwd: this.cwd,
+        mcpServers: [],
+      });
+      // 新进程不记得会话级配置（思考深度/模型），resume 后必须重套
+      this.lastConfigApplied = await applySessionConfig(proc, this.id, this.cfg);
+      for (const f of this.lastConfigApplied.failed) this.#hub.log.info(`[conv ${this.id}] ${f}`);
+      this.#hub.log.info(`[conv ${this.id}] 已 resume`);
+      return proc;
+    } catch (e) {
+      // ★ 半死的进程必须作废：它 alive 但**没有加载这个会话**，一旦留在 this.proc 上，
+      //   下次调用会走上面 `this.proc?.alive` 的快路径，把 session/prompt 发给一个
+      //   不认识该会话的进程 —— 会话就永久卡死了（重派也不会自愈）。
+      this.proc = null;
+      try {
+        proc.stop();
+      } catch {
+        /* 已经死了就无所谓 */
+      }
+      throw new Error(`恢复会话失败（已作废该进程，下次调用会重建）：${e.message}`);
+    }
   }
 
   // ── 流式更新收集 ────────────────────────────────────────────────
@@ -343,7 +356,27 @@ export class Conversation {
   // ── 跑任务 ──────────────────────────────────────────────────────
 
   /** 发一个回合并等到结束。 */
-  async prompt(text, { reasoning = 'hide', timeoutMs = PROMPT_TIMEOUT_MS, run } = {}) {
+  /**
+   * 派一个回合。
+   *
+   * **超时语义（这里曾经把会话跑挂，改之前务必读完）**
+   *
+   *   - **ACP 请求本身不设超时**：超时只决定"我们等不等"，永远不掐断回合。
+   *     旧实现给 ACP 请求设超时，一到期就本地放弃并把 `busy` 置 false —— 那是在
+   *     **谎报回合结束**：结果丢了、token 照烧，而且 reaper 看到 `busy=false` 就会
+   *     把一个**正在干活**的进程回收掉 → 回合变 `interrupted` → 该会话此后 resume 失败、
+   *     永久卡死（真实事故）。
+   *   - `wait=false`：压根不等，立即返回 `run_id`；回合真正结束时写哨兵通知调用方。
+   *   - `wait=true` ：最多等 `timeoutMs`（`<=0` 表示一直等）。到期**不报错、不丢结果**，
+   *     返回 `{still_running:true, run_id, sentinel_file}` —— 即把 wait=true 降级成 wait=false：
+   *     回合继续跑，结束时照常写哨兵，调用方拿 `run_id` 事后验收。
+   *
+   * @returns 等到回合结束 → 完整 result；没等到（wait=false 或等超时）→ 收据对象
+   */
+  async prompt(
+    text,
+    { reasoning = 'hide', timeoutMs = PROMPT_TIMEOUT_MS, run, wait = true, sentinel = false } = {},
+  ) {
     if (this.busy) {
       throw new Error(
         `会话 ${this.id} 正在跑另一个回合。可以：dsh_interject 插话（打断并改口 / 排队），或 dsh_interrupt 打断。`,
@@ -373,20 +406,14 @@ export class Conversation {
     };
     this.collector = c;
     const t0 = now();
-    let stopReason = null;
-    let failure = null;
-    try {
-      const res = await proc.request(
-        'session/prompt',
-        { sessionId: this.id, prompt: [{ type: 'text', text }] },
-        timeoutMs,
-      );
-      stopReason = res?.stopReason ?? null;
-      if (res?.usage) c.usage = c.usage ?? res.usage;
-    } catch (e) {
-      failure = e.message;
-      stopReason = 'error';
-    } finally {
+    let settled = false;
+    /** 调用方不会在原地等结果（fire-and-forget，或 wait=true 等超时转后台）→ 需要落哨兵通知它。 */
+    let backgrounded = sentinel || !wait;
+
+    /** 回合真正结束时收尾。无论有没有人在等，都**只执行一次**。 */
+    const finalize = (stopReason, failure) => {
+      if (settled) return runRecord.result;
+      settled = true;
       this.busy = false;
       this.collector = null;
       this.currentTool = null;
@@ -402,32 +429,76 @@ export class Conversation {
       const waiters = this.idleWaiters;
       this.idleWaiters = [];
       for (const w of waiters) w();
-    }
-    const after = gitStatus(this.cwd);
-    const result = {
+      const after = gitStatus(this.cwd);
+      const result = {
+        conversation_id: this.id,
+        run_id: runRecord.run_id,
+        stop_reason: stopReason,
+        error: failure,
+        answer: c.answer,
+        thinking: formatReasoning(c, reasoning),
+        thinking_stats: {
+          hidden: reasoning === 'hide' || reasoning === 'marker',
+          chars: c.reasoning.length,
+          chunks: c.reasoningChunks,
+          ms: c.reasoningStartedAt ? now() - c.reasoningStartedAt : 0,
+        },
+        tools_used: [...c.tools.values()],
+        usage: c.usage,
+        workspace_changed: before !== after,
+        diff_stat: after,
+        elapsed_ms: now() - t0,
+      };
+      runRecord.ended_at = now();
+      runRecord.elapsed_ms = result.elapsed_ms;
+      runRecord.status = failure ? 'error' : stopReason === 'cancelled' ? 'cancelled' : 'done';
+      runRecord.result = result;
+      if (backgrounded) this.#hub.writeRunSentinel(this.id, runRecord);
+      return result;
+    };
+
+    /** 没等到结果时给调用方的收据（它靠 run_id + 哨兵文件事后验收）。 */
+    const receipt = (waitedMs) => ({
       conversation_id: this.id,
       run_id: runRecord.run_id,
-      stop_reason: stopReason,
-      error: failure,
-      answer: c.answer,
-      thinking: formatReasoning(c, reasoning),
-      thinking_stats: {
-        hidden: reasoning === 'hide' || reasoning === 'marker',
-        chars: c.reasoning.length,
-        chunks: c.reasoningChunks,
-        ms: c.reasoningStartedAt ? now() - c.reasoningStartedAt : 0,
+      status: 'running',
+      still_running: true,
+      accepted: true,
+      background: true,
+      sentinel_file: this.#hub.runSentinelPath(this.id, runRecord.run_id),
+      waited_ms: waitedMs ?? 0,
+    });
+
+    // 关键：第三个参数传 0 = **不设超时**。回合只能由它自己结束，或由 session/cancel 结束。
+    const acp = proc.request('session/prompt', { sessionId: this.id, prompt: [{ type: 'text', text }] }, 0);
+    acp.then(
+      (res) => {
+        if (res?.usage) c.usage = c.usage ?? res.usage;
+        finalize(res?.stopReason ?? null, null);
       },
-      tools_used: [...c.tools.values()],
-      usage: c.usage,
-      workspace_changed: before !== after,
-      diff_stat: after,
-      elapsed_ms: now() - t0,
-    };
-    runRecord.ended_at = now();
-    runRecord.elapsed_ms = result.elapsed_ms;
-    runRecord.status = failure ? 'error' : stopReason === 'cancelled' ? 'cancelled' : 'done';
-    runRecord.result = result;
-    return result;
+      (e) => finalize('error', e.message),
+    );
+
+    if (!wait) return settled ? runRecord.result : receipt(0);
+    if (timeoutMs <= 0) {
+      await acp.then(
+        () => {},
+        () => {},
+      );
+      return runRecord.result;
+    }
+    const timedOut = await Promise.race([
+      acp.then(
+        () => false,
+        () => false,
+      ),
+      new Promise((r) => setTimeout(() => r(true), timeoutMs)),
+    ]);
+    if (timedOut && !settled) {
+      backgrounded = true; // 之后的 finalize 会写哨兵
+      return receipt(timeoutMs);
+    }
+    return runRecord.result;
   }
 
   /** 中断当前回合（ACP 原生，走的就是用户手动停止那条路径）。 */

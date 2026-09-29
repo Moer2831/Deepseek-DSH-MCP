@@ -28,7 +28,7 @@ Practical gotchas and trade-offs you *will* hit when letting Claude / Codex driv
 
 ## 2. Cost and budget
 
-**2.1 Long tasks must use `wait=false`.** MCP calls block; `dsh_send(wait=true)` occupies the caller's own turn. Use `wait=false`, get a `run_id`, and collect later with `dsh_get(conversation_id, run_id)`.
+**2.1 `dsh_send` does NOT block by default — stop passing `wait=false` manually.** It is already the default: you get a `run_id` + `sentinel_file` immediately, the turn runs in the background, and the sentinel file wakes you when it finishes. Only pass `wait=true` when you genuinely want to block; it occupies the caller's own turn, and on reaching `timeout_ms` (**default `0` = wait forever**) it **does not cancel the turn and does not lose the result** — it merely downgrades to background and hands you a receipt. A timeout is therefore no longer a disaster, and you should never invent one yourself. Collect with `dsh_get(conversation_id, run_id)` or, better, by reading the sentinel file (immune to the in-memory window).
 
 **2.2 Conversations are long-lived and history accumulates.** Cost grows with turn count. **One conversation per task**; release and start fresh for unrelated work. Watch `context_pressure` from `dsh_get`.
 

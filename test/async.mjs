@@ -70,7 +70,7 @@ try {
   const convB = b?.structuredContent?.conversation_id;
   const side = await client.callTool(
     'dsh_send',
-    { conversation_id: convB, prompt: '只回复两个字：待命' },
+    { conversation_id: convB, wait: true, prompt: '只回复两个字：待命' },
     240_000,
   );
   check('另一个会话可以正常完成回合', side?.structuredContent?.stop_reason === 'end_turn', McpClient.text(side).slice(0, 120));

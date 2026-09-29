@@ -60,6 +60,7 @@ try {
           'dsh_send',
           {
             conversation_id: j.id,
+            wait: true,
             prompt:
               '请做两件事，**不要向我询问任何路径**：\n' +
               '1. 运行一条命令，打印你**当前工作目录**的绝对路径，并把输出原样贴出来。\n' +

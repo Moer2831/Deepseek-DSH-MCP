@@ -6,7 +6,7 @@
 
 一个 MCP 服务端：把 DSH 当作**长驻的 agent 运行时**来驱动，而不是包一层命令行。开个会话、扔个目标，它自己写代码、跑脚本、派子代理；你随时能看、能插话、能回头验收。🛠️
 
-🧪 265 项检查全绿 · 🔌 MCP over stdio · 📜 MIT
+🧪 299 项检查全绿 · 🔌 MCP over stdio · 📜 MIT · 💬 开发社区 [linux.do](https://linux.do/)
 
 > 📌 **建议先读 [使用注意事项](USAGE-NOTES.md)** —— 会真正踩到的坑：ACP 模型配置陷阱、**外部 MCP 工具的副作用不受 DSH 沙箱约束**、工作区与 GUI 的注册表缓存、成本控制、以及一张故障速查表。
 
@@ -109,7 +109,7 @@ node test/smoke.mjs        # 不调用 LLM，验证整条管道
 | 工具 | 作用 |
 |---|---|
 | `dsh_start` | 建会话：工作区、权限档、审批策略、**思考深度（默认 `max`）**、模型 |
-| `dsh_send` | 派任务。`wait=true`（默认）阻塞到回合结束；**`wait=false` 立刻返回 `run_id` 与 `sentinel_file`**（回合结束时原子落地、含最终结果，供文件系统等待"跑完自动通知"） |
+| `dsh_send` | 派任务。**默认 `wait=false`：立刻返回 `run_id` + `sentinel_file`**，回合在后台跑，跑完由哨兵文件通知你（推荐）。`wait=true` 才原地阻塞到回合结束；到期（`timeout_ms`，默认 0 = 一直等）**只会转后台，不取消回合、不丢结果** |
 | `dsh_list` | 所有会话及运行状态：`running` / `idle` / `detached`，已跑时长、当前工具、本轮输出。`only_running=true` 只看活动会话 |
 | `dsh_read` | **游标式增量读**——看正在跑的会话此刻吐出了什么 |
 | `dsh_get` | 会话详情；带 `run_id` 时返回**那一次派活的完整结果**（"回头验收"的入口） |
@@ -121,7 +121,7 @@ node test/smoke.mjs        # 不调用 LLM，验证整条管道
 
 ## 用法：先派活，回头再验收
 
-MCP 工具调用是**阻塞**的。如果让 `dsh_send` 等一个 10 分钟的任务，你自己的回合就被卡住，还可能撞上宿主的工具超时。所以长任务要这样：
+MCP 工具调用是**阻塞**的，所以 `dsh_send` **默认就不阻塞**（`wait=false`）：派完立刻拿到收据，回合在后台跑，跑完由哨兵文件唤醒你。整个流程是这样：
 
 ```text
 1. dsh_send(conversation_id, prompt, wait=false)
@@ -256,7 +256,7 @@ node bin/dsh-mcp-workspaces.mjs --purge-test-sessions   # 删测试会话（规�
 | `DSH_MCP_PERMISSION` | `danger-full-access` | `dsh_start` 未指定时的权限档 |
 | `DSH_MCP_REASONING_EFFORT` | `max` | 默认思考深度 |
 | `DSH_MCP_IDLE_TTL_MS` | `300000` | 空闲多久回收会话进程（仍可 resume） |
-| `DSH_MCP_PROMPT_TIMEOUT_MS` | `1800000` | 单回合等待上限 |
+| `DSH_MCP_PROMPT_TIMEOUT_MS` | `0`（不设超时） | **仅 `wait=true` 时**的等待上限；到期只转后台，不取消回合 |
 | `DSH_MCP_APPROVAL_TIMEOUT_MS` | `300000` | 待决审批的等待上限 |
 | `DSH_MCP_REGISTER_WORKSPACE` | `project` | `project` / `all` / `0` |
 | `DSH_MCP_LOG` | `silent` | `silent` / `info` / `debug` |
@@ -279,12 +279,13 @@ node test/cleanup.mjs      # 单独跑收尾清理（只针对临时目录；--d
 | `integration` | 30 | 跨进程 resume 与记忆、中断、两种插话 |
 | `async` | 16 | fire-and-forget + 事后验收 |
 | `sentinel` | 36 | 完成哨兵：原子性、闩锁语义、多会话并发不串台、被取消也落地、**思考不进文件** |
+| `timeout` | 34 | **超时语义**：`wait=false` 不受 `timeout_ms` 影响、`wait=true` 到期只转后台（不取消/不丢结果、`busy` 不说谎）、`timeout_ms=0` 一直等、resume 失败会作废进程而不永久卡死 |
 | `concurrency` | 31 | 三会话并发 + 实时增量读 |
 | `capability` | 22 | 写代码、跑脚本、**自行派子代理**（用磁盘上的子会话头验证） |
 | `workspace-effect` | 24 | 不给路径时工作区是否真的生效 |
 | `acceptance` | 36 | 两个文件夹 × 两个会话做只读 IDA Pro 分析 |
 
-**合计 265 项检查，全绿。**
+**合计 299 项检查，全绿。**
 
 ## 已知限制
 
@@ -296,6 +297,10 @@ node test/cleanup.mjs      # 单独跑收尾清理（只针对临时目录；--d
 5. **首次成功回合之前就死掉的会话可能尚未落盘** —— 此时 resume 会报清晰错误。发出第一条消息后就安全了。
 6. **不能改名** —— DSH 的标题子系统没有对外改名接口（`SessionTitleService.rename` 需要进程内的活会话）。标题一律由首条消息自动生成。
 7. **`session/list` 只返回 `{sessionId, cwd}`，且排除已打开的会话** —— 对话名由本服务从 DSH 投影缓存补全。
+
+## 💬 社区
+
+本项目的发布与讨论都在 **[linux.do](https://linux.do/)** —— 使用问题、踩坑经验、改进建议都欢迎到那里聊。提 issue 也可以，但在社区里通常回得更快。
 
 ## 许可
 

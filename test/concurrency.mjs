@@ -33,11 +33,11 @@ const STATE = join(tmpdir(), `dsh-mcp-conc-state-${Date.now()}.json`);
 const wsRoot = mkdtempSync(join(tmpdir(), 'dsh-mcp-conc-'));
 const client = new McpClient({ env: { DSH_MCP_STATE: STATE } }).start();
 
-/** 三个会话各自的标记词，用于验证内容隔离。 */
+/** 三个会话各自的标记词，用于验证内容隔离。任务要足够长，才能覆盖后面几轮轮询。 */
 const CASES = [
-  { key: 'S1', marker: '阿尔法', prompt: '分三步做：先运行 Start-Sleep -Seconds 4 并汇报"第1步"，再运行 Start-Sleep -Seconds 4 并汇报"第2步"，最后回复"阿尔法完成"。' },
-  { key: 'S2', marker: '贝塔', prompt: '分三步做：先运行 Start-Sleep -Seconds 4 并汇报"第1步"，再运行 Start-Sleep -Seconds 4 并汇报"第2步"，最后回复"贝塔完成"。' },
-  { key: 'S3', marker: '伽马', prompt: '分三步做：先运行 Start-Sleep -Seconds 4 并汇报"第1步"，再运行 Start-Sleep -Seconds 4 并汇报"第2步"，最后回复"伽马完成"。' },
+  { key: 'S1', marker: '阿尔法', prompt: '分四步做：依次运行 4 次 Start-Sleep -Seconds 5，每次跑完汇报"第N步"，最后回复"阿尔法完成"。' },
+  { key: 'S2', marker: '贝塔', prompt: '分四步做：依次运行 4 次 Start-Sleep -Seconds 5，每次跑完汇报"第N步"，最后回复"贝塔完成"。' },
+  { key: 'S3', marker: '伽马', prompt: '分四步做：依次运行 4 次 Start-Sleep -Seconds 5，每次跑完汇报"第N步"，最后回复"伽马完成"。' },
 ];
 
 const conv = new Map();
@@ -46,23 +46,24 @@ try {
   await client.initialize();
 
   console.log('\n[1] 开 3 个会话（不同工作区）并各自后台派活');
-  for (const c of CASES) {
-    const ws = join(wsRoot, c.key);
-    mkdirSync(ws, { recursive: true });
-    const start = await client.callTool('dsh_start', { cwd: ws, permission: 'danger-full-access' }, 180_000);
-    const id = start?.structuredContent?.conversation_id;
-    conv.set(c.key, { ...c, id, ws, cursor: 0, seen: '' });
-    const send = await client.callTool(
-      'dsh_send',
-      { conversation_id: id, prompt: c.prompt, wait: false },
-      60_000,
-    );
-    check(
-      `${c.key} 会话已创建且任务已接受`,
-      !!id && send?.structuredContent?.background === true,
-      `id=${id} | ${McpClient.text(start).slice(0, 160)} | ${McpClient.text(send).slice(0, 160)}`,
-    );
-  }
+  // **并发**派活，且用默认的 wait=false（顺带验证默认值）。
+  // 必须并发：dsh_send 会等到进程起来（冷启动几秒），串行派活会让先派的任务在
+  // 后派任务的冷启动期间就跑完，后面"增量读"的断言会误判成没产出。
+  await Promise.all(
+    CASES.map(async (c) => {
+      const ws = join(wsRoot, c.key);
+      mkdirSync(ws, { recursive: true });
+      const start = await client.callTool('dsh_start', { cwd: ws, permission: 'danger-full-access' }, 180_000);
+      const id = start?.structuredContent?.conversation_id;
+      conv.set(c.key, { ...c, id, ws, cursor: 0, seen: '' });
+      const send = await client.callTool('dsh_send', { conversation_id: id, prompt: c.prompt }, 180_000);
+      check(
+        `${c.key} 会话已创建且任务已被接受（默认 wait=false）`,
+        !!id && send?.structuredContent?.background === true,
+        `id=${id} | ${McpClient.text(start).slice(0, 160)} | ${McpClient.text(send).slice(0, 160)}`,
+      );
+    }),
+  );
 
   console.log('\n[1b] 工作区不存在时应给出清晰报错（而不是卡住）');
   const badStart = await client.callTool('dsh_start', { cwd: join(wsRoot, 'definitely-not-here') }, 60_000);

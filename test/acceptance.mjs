@@ -112,7 +112,7 @@ async function runSession(client, t) {
 
     const send = await client.callTool(
       'dsh_send',
-      { conversation_id: rec.conversation_id, prompt: t.prompt, timeout_ms: 600_000 },
+      { conversation_id: rec.conversation_id, wait: true, prompt: t.prompt, timeout_ms: 600_000 },
       660_000,
     );
     const r = send?.structuredContent ?? {};

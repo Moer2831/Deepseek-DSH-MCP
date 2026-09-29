@@ -112,7 +112,7 @@ try {
   const sends = await Promise.all(
     started.map((j) =>
       client
-        .callTool('dsh_send', { conversation_id: j.id, prompt: j.prompt, timeout_ms: 900_000 }, 960_000)
+        .callTool('dsh_send', { conversation_id: j.id, wait: true, prompt: j.prompt, timeout_ms: 900_000 }, 960_000)
         .then((r) => ({ j, r }))
         .catch((e) => ({ j, r: null, err: e.message })),
     ),

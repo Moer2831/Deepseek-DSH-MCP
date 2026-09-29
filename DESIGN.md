@@ -340,7 +340,7 @@ Profile = `~/.dsh/profiles/<name>/`，由 `package.json` 的 `dsh.profile.bundle
 
 | 工具 | 主要入参 | 返回 |
 |---|---|---|
-| `dsh_send` | `conversation_id, prompt, wait?, timeout_ms?, reasoning?, output?, max_chars?` | `wait=true`：`{run_id, status, answer, thinking_stats, tools_used, diff, usage, cursor}`；`wait=false`：`{run_id, accepted, background, sentinel_file}`（完成哨兵见 B9） |
+| `dsh_send` | `conversation_id, prompt, wait?, timeout_ms?, reasoning?, output?, max_chars?` | **默认 `wait=false`**：`{run_id, accepted, background, sentinel_file}`（完成哨兵见 B9）；`wait=true`：`{run_id, status, answer, thinking_stats, tools_used, diff, usage, cursor}`；`wait=true` 等超时 → 收据（`still_running`），**回合不取消、结果不丢** |
 | `dsh_run` | 同上但 `wait=false` 语义 | `{run_id, sentinel_file}` |
 | `dsh_read` | `run_id, cursor?, reasoning?` | `{status, text_delta, events, cursor, done}` |
 | `dsh_status` | `conversation_id` | `{status, turn, step, current_tool}` |

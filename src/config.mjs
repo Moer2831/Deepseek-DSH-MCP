@@ -126,8 +126,17 @@ export function toPosixPath(p) {
   return `/${m[1].toLowerCase()}/${m[2].replace(/\\/g, '/')}`;
 }
 
-/** 单条 prompt 的最长等待时间（毫秒）。DSH 干活可以很久，默认 30 分钟。 */
-export const PROMPT_TIMEOUT_MS = Number(process.env.DSH_MCP_PROMPT_TIMEOUT_MS ?? 30 * 60 * 1000);
+/**
+ * `wait=true` 时的**等待**上限（毫秒）。**默认 0 = 不设超时（一直等）**。
+ *
+ * 为什么不给默认值：只有调用方知道任务要多久，我们凭空发明一个"30 分钟"只会误伤长任务。
+ * 而且现在超时**不再破坏任何东西**（到期只是降级为后台：回合继续跑、结果照常由哨兵送达），
+ * 所以"等多久"纯粹是调用方的偏好，不该由我们替他决定。
+ * 需要全局兜底时设 DSH_MCP_PROMPT_TIMEOUT_MS。
+ *
+ * 另注：`dsh_send` **默认 `wait=false`**，压根不走等待路径，这个值通常用不上。
+ */
+export const PROMPT_TIMEOUT_MS = Number(process.env.DSH_MCP_PROMPT_TIMEOUT_MS ?? 0);
 
 /** 普通 ACP 请求的超时（毫秒）。 */
 export const REQUEST_TIMEOUT_MS = Number(process.env.DSH_MCP_REQUEST_TIMEOUT_MS ?? 60_000);

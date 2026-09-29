@@ -49,7 +49,7 @@ try {
   const secret = '紫色河马';
   const r1 = await client.callTool(
     'dsh_send',
-    { conversation_id: convId, prompt: `请记住这个暗号：${secret}。然后只回复两个字：收到`, timeout_ms: 180_000 },
+    { conversation_id: convId, wait: true, prompt: `请记住这个暗号：${secret}。然后只回复两个字：收到`, timeout_ms: 180_000 },
     200_000,
   );
   const s1 = r1?.structuredContent ?? {};
@@ -69,7 +69,7 @@ try {
 
   const r2 = await client.callTool(
     'dsh_send',
-    { conversation_id: convId, prompt: '刚才我让你记的暗号是什么？只回复暗号本身，不要别的字。', timeout_ms: 180_000 },
+    { conversation_id: convId, wait: true, prompt: '刚才我让你记的暗号是什么？只回复暗号本身，不要别的字。', timeout_ms: 180_000 },
     200_000,
   );
   const s2 = r2?.structuredContent ?? {};
@@ -112,7 +112,7 @@ try {
   console.log('\n[4] 中断后会话仍可继续（验证中断不损坏会话）');
   const r4 = await client.callTool(
     'dsh_send',
-    { conversation_id: convId, prompt: '只回复两个字：正常', timeout_ms: 180_000 },
+    { conversation_id: convId, wait: true, prompt: '只回复两个字：正常', timeout_ms: 180_000 },
     200_000,
   );
   const s4 = r4?.structuredContent ?? {};

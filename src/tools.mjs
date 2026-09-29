@@ -59,9 +59,13 @@ export const TOOL_DEFS = [
   {
     name: 'dsh_send',
     description:
-      '向会话派一个任务。默认（wait=true）阻塞到回合结束再返回最终答复；' +
-      '**长任务建议 wait=false**：立刻返回 run_id 与 sentinel_file，你继续做别的事。' +
-      'wait=false 时，回合结束（成功或失败）会在 sentinel_file 原子落地一个含最终结果的小文件——' +
+      '向会话派一个任务。**默认不阻塞（wait=false）**：立即返回 run_id + sentinel_file，' +
+      '回合在后台跑，跑完自动通知你 —— 你继续做别的事，也永远不用担心任务被"超时"打断。' +
+      '想原地等结果就显式传 wait=true（可配 timeout_ms；到期只会转后台，不会取消回合）。' +
+      '【超时不会毁掉任务】wait=true 到达 timeout_ms 仍没跑完时，本工具**不会报错、也不会取消回合**，' +
+      '而是自动降级为后台：返回 run_id + sentinel_file，回合继续跑完，结果稍后由哨兵文件通知。' +
+      '（timeout_ms=0 表示一直等。）所以任何时候你都能拿到结果，不用怕"超时了白干"。' +
+      '等待模式与后台模式都在回合结束时原子落地一个含最终结果的小文件——' +
       '**推荐用后台任务（Bash run_in_background + `until [ -f sentinel_file ]`）等它，跑完自动通知你，无需轮询**；' +
       '文件出现后读它即得结果，或用 dsh_get(conversation_id, run_id) 验收，dsh_read 可中途看输出。' +
       '默认隐藏思考内容（只返回正文 + 思考统计）。' +
@@ -70,13 +74,21 @@ export const TOOL_DEFS = [
       {
         conversation_id: CONV_ID,
         prompt: { type: 'string', description: '任务描述。可以引用工作区里的文件路径。' },
-        wait: { type: 'boolean', description: 'true（默认）阻塞到回合结束；false 立即返回并后台执行。' },
+        wait: {
+          type: 'boolean',
+          description:
+            '**默认 false**：立即返回 run_id + sentinel_file，回合在后台跑，跑完由哨兵文件通知（推荐用法）。true = 原地阻塞到回合结束再返回完整结果。',
+        },
         reasoning: {
           type: 'string',
           enum: REASONING_MODES,
           description: `思考内容展示档位。默认 ${DEFAULT_REASONING}（只返回正文，思考只给统计）。full 会占用大量上下文。`,
         },
-        timeout_ms: { type: 'number', description: '阻塞等待上限，默认 30 分钟。' },
+        timeout_ms: {
+          type: 'number',
+          description:
+            '仅 wait=true 时的**等待**上限（毫秒），默认 30 分钟；0 = 一直等。到期不会取消回合，只会转成后台并给你 run_id。',
+        },
       },
       ['conversation_id', 'prompt'],
     ),
@@ -149,7 +161,7 @@ export const TOOL_DEFS = [
           enum: REASONING_MODES,
           description: `思考内容展示档位，默认 ${DEFAULT_REASONING}。`,
         },
-        timeout_ms: { type: 'number', description: '新回合的等待上限，默认 30 分钟。' },
+        timeout_ms: { type: 'number', description: '新回合的**等待**上限（毫秒），默认 30 分钟；0 = 一直等。到期转后台，不取消回合。' },
       },
       ['conversation_id', 'message'],
     ),
@@ -231,6 +243,44 @@ function renderSendResult(r) {
 }
 
 /** 工具处理器表。 */
+/**
+ * 后台收据的渲染：wait=false 直接走这里；wait=true 等超时会自动降级到这里。
+ * 关键语义：**回合没有被取消**，只是我们不再原地等 —— 结果稍后由哨兵文件通知。
+ */
+function backgroundReceipt(hub, conv, res) {
+  const sentinel = res.sentinel_file ?? hub.runSentinelPath(conv.id, res.run_id);
+  const sentinelPosix = toPosixPath(sentinel);
+  const waited = res.waited_ms
+    ? `已等待 ${(res.waited_ms / 1000).toFixed(0)}s 仍未结束，改为后台继续（**回合没有被取消**）。`
+    : '已在后台执行（**回合没有被取消**）。';
+  return {
+    structured: {
+      conversation_id: conv.id,
+      run_id: res.run_id,
+      accepted: true,
+      background: true,
+      still_running: true,
+      sentinel_file: sentinel,
+      /** Bash/MSYS 形式（D:\a\b → /d/a/b）；非 Windows 等于 sentinel_file。 */
+      sentinel_file_posix: sentinelPosix,
+    },
+    text:
+      `${waited}（run_id=${res.run_id}）\n\n` +
+      `【跑完自动通知，无需轮询】完成时（成功/失败/被取消）会原子写出这个文件（含最终结果，但**不含思考内容**）：\n` +
+      `  ${sentinel}\n` +
+      `直接用下面这个 Bash 形式路径，**不要手工转换**（写错会一直等到超时）：\n` +
+      `  ${sentinelPosix}\n` +
+      `推荐用后台任务等它出现，文件一到就会唤醒你：\n` +
+      `  Bash(run_in_background): sent="${sentinelPosix}"; \\\n` +
+      `    dl=$(( $(date +%s)+2100 )); until [ -f "$sent" ]; do [ $(date +%s) -ge $dl ] && { echo TIMEOUT; exit 1; }; sleep 2; done; echo DONE\n` +
+      `文件出现后：直接读它拿结果（推荐——不受内存窗口限制、还扛服务重启），或 dsh_get(conversation_id, run_id) 验收。\n` +
+      `消费完可以 rm 掉它。其它随时可用：dsh_status（是否在跑）、dsh_read（增量看输出）。` +
+      (res.waited_ms
+        ? `\n\n下次想立刻返回就传 wait=false；想等更久就调大 timeout_ms（**0 = 一直等**）。`
+        : ''),
+  };
+}
+
 export function createHandlers(hub) {
   return {
     async dsh_start(args) {
@@ -263,56 +313,27 @@ export function createHandlers(hub) {
       const opts = { reasoning: args.reasoning ?? DEFAULT_REASONING };
       if (args.timeout_ms) opts.timeoutMs = args.timeout_ms;
 
-      if (args.wait === false) {
+      // ── 默认路径：后台派活（wait !== true）──────────
+      // 默认不阻塞：立即给收据 + 哨兵路径，回合结束时自动通知。想原地等就显式传 wait=true。
+      if (args.wait !== true) {
         if (conv.busy) {
           throw new Error(
             '会话正在跑另一个回合，无法再排一个。可以：dsh_interject（插话）或 dsh_interrupt（打断）后重试。',
           );
         }
         const run = conv.createRun(args.prompt);
-        conv.background = conv
-          .prompt(args.prompt, { ...opts, run })
-          .then((r) => {
-            conv.lastResult = r;
-            hub.writeRunSentinel(conv.id, run); // run.status/result 此时已由 prompt() 设定
-            return r;
-          })
-          .catch((e) => {
-            run.status = 'error';
-            run.ended_at = Date.now();
-            run.error = e.message;
-            conv.lastResult = { error: e.message, stop_reason: 'error', run_id: run.run_id };
-            hub.writeRunSentinel(conv.id, run); // 失败/异常路径同样落哨兵（覆盖所有终止态）
-            return conv.lastResult;
-          });
-        const sentinel = hub.runSentinelPath(conv.id, run.run_id);
-        const sentinelPosix = toPosixPath(sentinel);
-        return {
-          structured: {
-            conversation_id: conv.id,
-            run_id: run.run_id,
-            accepted: true,
-            background: true,
-            sentinel_file: sentinel,
-            /** Bash/MSYS 形式（D:\a\b → /d/a/b）；非 Windows 等于 sentinel_file。 */
-            sentinel_file_posix: sentinelPosix,
-          },
-          text:
-            `已在后台开始执行（run_id=${run.run_id}）。你现在可以继续做别的事。\n\n` +
-            `【跑完自动通知，无需轮询】完成时（成功/失败/被取消）会原子写出这个文件（含最终结果，但**不含思考内容**）：\n` +
-            `  ${sentinel}\n` +
-            `直接用下面这个 Bash 形式路径，**不要手工转换**（写错会一直等到超时）：\n` +
-            `  ${sentinelPosix}\n` +
-            `推荐用后台任务等它出现，文件一到就会唤醒你：\n` +
-            `  Bash(run_in_background): sent="${sentinelPosix}"; \\\n` +
-            `    dl=$(( $(date +%s)+2100 )); until [ -f "$sent" ]; do [ $(date +%s) -ge $dl ] && { echo TIMEOUT; exit 1; }; sleep 2; done; echo DONE\n` +
-            `文件出现后：直接读它拿结果（推荐——不受内存窗口限制、还扛服务重启），或 dsh_get(conversation_id, run_id) 验收。\n` +
-            `消费完可以 rm 掉它。其它随时可用：dsh_status（是否在跑）、dsh_read（增量看输出）。`,
-        };
+        // prompt() 自己负责收尾与写哨兵（sentinel: true）。这里 await 是为了
+        // **同步暴露 resume/启动失败** —— 否则调用方会拿到一个 accepted 但注定失败的收据。
+        // 冷启动时这一步要几秒（要拉进程 + resume），热会话是瞬时。
+        const res = await conv.prompt(args.prompt, { ...opts, run, wait: false, sentinel: true });
+        conv.lastResult = res;
+        return res.still_running ? backgroundReceipt(hub, conv, res) : { structured: res, text: renderSendResult(res) };
       }
 
+      // ── 等待模式：等到就返回结果；等超时则自动降级为后台（不报错、不丢结果）──
       const r = await conv.prompt(args.prompt, opts);
       conv.lastResult = r;
+      if (r?.still_running) return backgroundReceipt(hub, conv, r);
       return { structured: r, text: renderSendResult(r) };
     },
 

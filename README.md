@@ -6,7 +6,7 @@
 
 An MCP server that drives DSH as a **long-lived agent runtime** instead of wrapping a CLI. Open a conversation, hand it a goal, and it writes code, runs scripts and spawns its own subagents — while you watch, cut in, and collect the result whenever you like. 🛠️
 
-🧪 265 checks green · 🔌 MCP over stdio · 📜 MIT
+🧪 299 checks green · 🔌 MCP over stdio · 📜 MIT · 💬 Community: [linux.do](https://linux.do/)
 
 > 📌 **Read the [Usage Notes](USAGE-NOTES.en.md) first** — the practical gotchas that will actually bite you: the ACP model-config trap, external MCP tools bypassing DSH's sandbox, the workspace/GUI registry cache, cost control, and a troubleshooting table.
 
@@ -109,7 +109,7 @@ node test/smoke.mjs        # no LLM calls, verifies the whole plumbing
 | Tool | What it does |
 |---|---|
 | `dsh_start` | Create a conversation: workspace, permission tier, approval policy, **reasoning effort (default `max`)**, model |
-| `dsh_send` | Hand it a task. `wait=true` (default) blocks until the turn ends; **`wait=false` returns a `run_id` and a `sentinel_file`** (atomically written when the turn ends, containing the final result — lets you wait for completion via the filesystem, no polling) |
+| `dsh_send` | Hand it a task. **Defaults to `wait=false`: returns a `run_id` + `sentinel_file` immediately**, the turn runs in the background and the sentinel file notifies you when it's done (recommended). `wait=true` blocks until the turn ends; hitting `timeout_ms` (default `0` = wait forever) **only downgrades to background — the turn is never cancelled and the result is never lost** |
 | `dsh_list` | All conversations with live state: `running` / `idle` / `detached`, elapsed time, current tool, output so far. `only_running=true` for active ones |
 | `dsh_read` | **Cursor-based incremental read** of what a *running* conversation is producing right now |
 | `dsh_get` | Conversation details; with `run_id`, the **final result of that dispatch** (the "collect the result later" entry point) |
@@ -121,7 +121,7 @@ node test/smoke.mjs        # no LLM calls, verifies the whole plumbing
 
 ## Workflow: dispatch, then collect later
 
-MCP tool calls **block**. If you let `dsh_send` wait for a 10-minute task, your own turn is stuck and you may hit the host's tool timeout. So for anything long:
+MCP tool calls **block**, so `dsh_send` **does not block by default** (`wait=false`): you get a receipt immediately, the turn runs in the background, and the sentinel file wakes you when it finishes. The whole flow:
 
 ```text
 1. dsh_send(conversation_id, prompt, wait=false)
@@ -256,7 +256,7 @@ Silent by default — **not one byte is written**.
 | `DSH_MCP_PERMISSION` | `danger-full-access` | Default tier for `dsh_start` |
 | `DSH_MCP_REASONING_EFFORT` | `max` | Default reasoning effort |
 | `DSH_MCP_IDLE_TTL_MS` | `300000` | Idle before a conversation's process is reaped (still resumable) |
-| `DSH_MCP_PROMPT_TIMEOUT_MS` | `1800000` | Max wait for one turn |
+| `DSH_MCP_PROMPT_TIMEOUT_MS` | `0` (no timeout) | Wait bound for **`wait=true` only**; on expiry the turn merely moves to the background |
 | `DSH_MCP_APPROVAL_TIMEOUT_MS` | `300000` | How long a pending approval waits |
 | `DSH_MCP_REGISTER_WORKSPACE` | `project` | `project` / `all` / `0` |
 | `DSH_MCP_LOG` | `silent` | `silent` / `info` / `debug` |
@@ -279,12 +279,13 @@ The suite **cleans up after itself**: `run.mjs` always ends with `cleanup.mjs`, 
 | `integration` | 30 | resume-with-memory across processes, interrupt, both interject modes |
 | `async` | 16 | fire-and-forget + later collection |
 | `sentinel` | 36 | completion sentinel: atomicity, latch semantics, per-conversation namespacing under concurrency, cancelled runs still land it, and **reasoning never reaching the file** |
+| `timeout` | 34 | **timeout semantics**: `wait=false` is unaffected by `timeout_ms`; a `wait=true` expiry merely downgrades to background (turn not cancelled, result not lost, `busy` never lies); `timeout_ms=0` waits forever; a failed resume invalidates the process instead of wedging the conversation |
 | `concurrency` | 31 | three simultaneous conversations + live incremental reads |
 | `capability` | 22 | writing code, running scripts, **spawning its own subagents** (verified on disk via child session headers) |
 | `workspace-effect` | 24 | workspace actually effective when no path is given |
 | `acceptance` | 36 | two folders × two conversations doing a read-only IDA Pro analysis |
 
-**Total: 265 checks, all green.**
+**Total: 299 checks, all green.**
 
 ## Known limitations
 
@@ -295,6 +296,10 @@ The suite **cleans up after itself**: `run.mjs` always ends with `cleanup.mjs`, 
 5. **A conversation that dies before its first successful turn may never have materialized on disk** — resume then fails with a clear error. Safe after the first message.
 6. **No renaming** — DSH's title subsystem has no external rename API (`SessionTitleService.rename` requires a live in-process session). Titles are auto-generated from the first message.
 7. **`session/list` returns only `{sessionId, cwd}` and excludes already-open sessions** — titles are filled in by this server from DSH's projection cache.
+
+## 💬 Community
+
+This project is announced and discussed on **[linux.do](https://linux.do/)** — usage questions, war stories and suggestions are all welcome there. Issues work too, but you'll usually get a faster answer in the community.
 
 ## License
 
