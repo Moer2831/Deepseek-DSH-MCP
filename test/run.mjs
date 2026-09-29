@@ -24,6 +24,10 @@ if (code === 0) {
   // 哨兵留存是纯文件系统 + 启动路径，不花 token —— 归到"冒烟一档"，每次必跑
   code = await run('prune.mjs');
 }
+if (code === 0) {
+  // 环境变量守卫：纯模块加载，不花 token，也归到"必跑"
+  code = await run('guards.mjs');
+}
 if (code === 0 && all) {
   code = await run('boundary.mjs');
 }

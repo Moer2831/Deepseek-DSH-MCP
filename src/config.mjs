@@ -155,10 +155,16 @@ export const REQUEST_TIMEOUT_MS = Number(process.env.DSH_MCP_REQUEST_TIMEOUT_MS 
  *   想省内存就设成毫秒数（如 `300000` = 5 分钟），但那就回到了"锁可能被 GUI 抢走"的世界。
  *   （无论哪种模式，锁心跳都会一直续 —— 否则别的实例会误判我们卡死并抢占。）
  */
-export const IDLE_TTL_MS = Number(process.env.DSH_MCP_IDLE_TTL_MS ?? 0);
+const rawIdle = Number(process.env.DSH_MCP_IDLE_TTL_MS ?? 0);
+/** ★ `<= 0` 或非法值一律当作"永不回收"。
+ *  否则 `-1` 会被算成 `cutoff = now + 1` → **立刻回收**（谁会想到负数=马上收 ✗），
+ *  `NaN` 更糟：比较永远为假，行为取决于具体分支。宁可把"奇怪的输入"统一压到安全侧。 */
+export const IDLE_TTL_MS = Number.isFinite(rawIdle) && rawIdle > 0 ? rawIdle : 0;
 
-/** 后台回收扫描间隔（毫秒）。 */
-export const REAP_INTERVAL_MS = Number(process.env.DSH_MCP_REAP_INTERVAL_MS ?? 30_000);
+/** 后台回收扫描间隔（毫秒）。**下限 200 毫秒**：0/负数会变成空转的紧循环 ✗（还会把心跳刷爆）。
+ *  下限留得比较低，是为了让测试能把间隔调小去观察心跳与回收时序。 */
+const rawReap = Number(process.env.DSH_MCP_REAP_INTERVAL_MS ?? 30_000);
+export const REAP_INTERVAL_MS = Number.isFinite(rawReap) && rawReap >= 200 ? rawReap : 30_000;
 
 /**
  * `dsh_list` 的"磁盘探测"结果缓存多久（毫秒）。

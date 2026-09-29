@@ -34,8 +34,15 @@ import { STATE_FILE, REAP_INTERVAL_MS } from './config.mjs';
 /** 每个 MCP 进程一个身份串（防 PID 复用误判）。 */
 export const MCP_TOKEN = randomUUID();
 
-/** 心跳超过这个时长就认为那个 MCP 实例已经死了或卡死了。 */
-export const STALE_MS = Number(process.env.DSH_MCP_LOCK_STALE_MS ?? 3 * REAP_INTERVAL_MS);
+/**
+ * 心跳超过这个时长就认为那个 MCP 实例已经死了或卡死了。
+ *
+ * ★ 守卫：**下限 30 秒**。设成 0/负数（有人会以为那是"关闭判定"）会让所有持锁登记
+ *   立刻显示为"过期"，于是别的实例会**合法地抢占并杀掉我们的子进程** ✗ —— 这是
+ *   最不能靠"用户猜对语义"的一个开关，所以把奇怪输入统一压到安全侧。
+ */
+const rawStale = Number(process.env.DSH_MCP_LOCK_STALE_MS ?? 3 * REAP_INTERVAL_MS);
+export const STALE_MS = Number.isFinite(rawStale) && rawStale >= 30_000 ? rawStale : Math.max(30_000, 3 * REAP_INTERVAL_MS);
 
 export const LOCKS_DIR = process.env.DSH_MCP_LOCKS_DIR ?? join(dirname(STATE_FILE), 'locks');
 

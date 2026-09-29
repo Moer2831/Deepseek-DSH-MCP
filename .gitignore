@@ -28,6 +28,9 @@ desktop.ini
 *.bak
 *.orig
 *.rej
+*.pid
+# 排障时随手写的临时脚本：绝不提交（正式的测试都在 test/*.mjs）
+test/_*.mjs
 dist/
 build/
 coverage/

@@ -65,6 +65,27 @@ try {
 }
 log(`  遗留临时工作区目录：删除 ${dirsRemoved} 个`);
 
+// 4b) ★ 桌面上遗留的测试文件夹（`dsh-mcp-test-A/B`、`dsh-conc-*`）——
+//     验收测试与旧版并发测试会在这两个位置造真实工作区，跑完必须收干净。
+//     设了 DSH_MCP_KEEP_EVIDENCE=1 就跳过（那是要人工翻看证据）。
+let foldersRemoved = 0;
+if (process.env.DSH_MCP_KEEP_EVIDENCE === '1') {
+  log('  桌面测试文件夹：已跳过（DSH_MCP_KEEP_EVIDENCE=1）');
+} else {
+  try {
+    const desktop = join(homedir(), 'Desktop');
+    for (const name of ['dsh-mcp-test-A', 'dsh-mcp-test-B', 'dsh-conc-A', 'dsh-conc-B', 'dsh-conc-C']) {
+      const p = join(desktop, name);
+      if (!existsSync(p)) continue;
+      if (!dryRun) rmSync(p, { recursive: true, force: true });
+      foldersRemoved++;
+    }
+  } catch {
+    /* 桌面不可读就算了 */
+  }
+  log(`  桌面遗留测试文件夹：删除 ${foldersRemoved} 个`);
+}
+
 // 5) 事后核对
 if (!dryRun) {
   const list = listWorkspaces();

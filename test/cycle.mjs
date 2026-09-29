@@ -89,9 +89,16 @@ try {
   }
 
   console.log('\n[2] 回收之后的锁状态（锁不该被"无名持有"）');
-  const liveOrphan = locks.listOrphans();
-  check('★ 没有留下孤儿持有者', liveOrphan.length === 0, JSON.stringify(liveOrphan));
-  const holder = locks.classifyHolder(conv);
+  // ★ 轮询到收敛再断言：回收是异步的（stop 要等子进程真退出），
+  //   上去就断言会偶发失败 —— 那是测试在抓瞬间，不是产品问题。
+  let orphans = locks.listOrphans();
+  let holder = locks.classifyHolder(conv);
+  for (let i = 0; i < 20 && (orphans.length > 0 || !['none', 'self'].includes(holder.kind)); i++) {
+    await sleep(500);
+    orphans = locks.listOrphans();
+    holder = locks.classifyHolder(conv);
+  }
+  check('★ 没有留下孤儿持有者（已等到收敛）', orphans.length === 0, JSON.stringify(orphans));
   check('★ 当前 lock_holder = none/self（不是无法归因的状态）', ['none', 'self'].includes(holder.kind), holder.reason);
   const stNow = await client.callTool('dsh_status', { conversation_id: conv });
   const lh = stNow?.structuredContent?.lock_holder;

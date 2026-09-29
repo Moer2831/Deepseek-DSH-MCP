@@ -189,6 +189,26 @@ try {
   results.push({ key: 'FATAL', problems: [e.message] });
 } finally {
   await client.close();
+  // ★ 默认自清理：这个验收测试**故意**在桌面造两个工作区（真实场景），但跑完必须收拾干净，
+  //   否则你桌面上每次都会多出 `dsh-mcp-test-A/B` 两个文件夹。
+  //   想保留证据（人工翻看文件）就设 DSH_MCP_KEEP_EVIDENCE=1。
+  if (process.env.DSH_MCP_KEEP_EVIDENCE === '1') {
+    console.log('\n证据已保留（DSH_MCP_KEEP_EVIDENCE=1）：');
+    console.log(`  ${FOLDER_A}\n  ${FOLDER_B}`);
+  } else {
+    const { rmSync } = await import('node:fs');
+    const { purgeTestSessions, pruneTestWorkspaces } = await import('../src/workspace.mjs');
+    const ids = results.map((r) => r.conversation_id).filter(Boolean);
+    if (ids.length) purgeTestSessions({ ids, idsOnly: true });
+    for (const d of [FOLDER_A, FOLDER_B]) {
+      try {
+        rmSync(d, { recursive: true, force: true });
+      } catch {}
+    }
+    // 工作区登记按路径模式清掉（`pruneEmptyWorkspaces` 依赖"路径已消失"的启发式，不够稳）
+    pruneTestWorkspaces();
+    console.log('\n已清理桌面测试文件夹、会话与工作区登记（保留证据请设 DSH_MCP_KEEP_EVIDENCE=1）');
+  }
 }
 
 // ── 汇总 ──────────────────────────────────────────────────────────
