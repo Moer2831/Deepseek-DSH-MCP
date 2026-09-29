@@ -234,8 +234,10 @@ export class Conversation {
     });
     proc.start();
     this.proc = proc;
-    // 登记"我为这个会话拉起了哪个子进程" —— 抢锁时要靠它判断持有者是谁
-    writeMarker(this.id, { childPid: proc.pid, cwd: this.cwd });
+    // ★ 登记**推迟到真正拿到写锁之后**（见下面 resume 成功处）。
+    //   登记的含义是"我正持有这个会话的写锁"，不是"我拉起了一个进程"。
+    //   若在这里就写，一次注定撞锁失败的 resume 会先把"谁持有"的线索覆盖掉、
+    //   失败路径再把它删掉 —— 抢占逻辑就只能看到 none，无法判定持有者（真实 bug）。
     try {
       await proc.initialize();
       // 能走到这里说明本会话刚新建了一个 DSH 进程（Hub.create 之后进程一直活着，不会进这个分支），
@@ -248,6 +250,8 @@ export class Conversation {
       // 新进程不记得会话级配置（思考深度/模型），resume 后必须重套
       this.lastConfigApplied = await applySessionConfig(proc, this.id, this.cfg);
       for (const f of this.lastConfigApplied.failed) this.#hub.log.info(`[conv ${this.id}] ${f}`);
+      // 锁到手了，这时才登记；从此别人能查到"锁在我们手上"
+      writeMarker(this.id, { childPid: proc.pid, cwd: this.cwd });
       this.#hub.log.info(`[conv ${this.id}] 已 resume`);
       return proc;
     } catch (e) {
@@ -260,6 +264,7 @@ export class Conversation {
       } catch {
         /* 已经死了就无所谓 */
       }
+      // 只删**自己的**登记（removeMarker 会校验 token）；别人的登记必须留着当线索
       removeMarker(this.id);
       // 写锁冲突是最常见也最需要"说人话"的失败：DSH 的 SessionAlreadyOwnedError 会被
       // ACP 包成 -32603 "Internal error"，只说这句调用方根本不知道该怎么办。
@@ -479,7 +484,25 @@ export class Conversation {
     runRecord.status = 'running';
     runRecord.started_at = now();
     const before = gitStatus(this.cwd);
-    const proc = await this.ensureAlive();
+    let proc;
+    try {
+      proc = await this.ensureAlive();
+    } catch (e) {
+      // 起不来（撞写锁 / 会话损坏）就别留一条永远 "running" 的幽灵记录。
+      // 调用方这次拿到的是 isError、并没有 run_id，所以这里不写哨兵。
+      runRecord.status = 'error';
+      runRecord.ended_at = now();
+      runRecord.error = e.message;
+      runRecord.result = {
+        conversation_id: this.id,
+        run_id: runRecord.run_id,
+        stop_reason: 'error',
+        error: e.message,
+        answer: '',
+        elapsed_ms: 0,
+      };
+      throw e;
+    }
     this.busy = true;
     this.currentTurn += 1;
     this.turnStartedAt = now();
@@ -505,51 +528,80 @@ export class Conversation {
     const finalize = (stopReason, failure) => {
       if (settled) return runRecord.result;
       settled = true;
-      this.busy = false;
-      this.collector = null;
-      this.currentTool = null;
-      this.pushOut('turn', `第 ${this.currentTurn} 轮结束（${stopReason ?? 'unknown'}）`, {
-        phase: 'end',
-        stop_reason: stopReason,
-        error: failure ?? undefined,
-      });
-      this.turnCount += 1;
-      this.lastUsedAt = now();
-      this.#hub.save();
-      // 唤醒所有"等本轮结束"的插话请求（busy 已置 false，它们可以安全地发下一轮）
-      const waiters = this.idleWaiters;
-      this.idleWaiters = [];
-      for (const w of waiters) w();
-      const after = gitStatus(this.cwd);
-      const result = {
-        conversation_id: this.id,
-        run_id: runRecord.run_id,
-        stop_reason: stopReason,
-        error: failure,
-        answer: c.answer,
-        thinking: formatReasoning(c, reasoning),
-        thinking_stats: {
-          hidden: reasoning === 'hide' || reasoning === 'marker',
-          chars: c.reasoning.length,
-          chunks: c.reasoningChunks,
-          ms: c.reasoningStartedAt ? now() - c.reasoningStartedAt : 0,
-        },
-        tools_used: [...c.tools.values()],
-        usage: c.usage,
-        workspace_changed: before !== after,
-        diff_stat: after,
-        elapsed_ms: now() - t0,
-      };
-      runRecord.ended_at = now();
-      runRecord.elapsed_ms = result.elapsed_ms;
-      runRecord.status = failure ? 'error' : stopReason === 'cancelled' ? 'cancelled' : 'done';
-      runRecord.result = result;
-      // ★ 无条件写哨兵：**一个回合 = 一个哨兵文件**，没有例外。
-      //   之前只在"调用方没在原地等"时才写，于是插话那一轮没有哨兵 —— 调用方的
-      //   等待逻辑（等文件出现）就永远空等，即使 run 早已 status=done（真实事故）。
-      //   统一规则也消除了整类"有 run_id 却没有哨兵"的坑。
-      this.#hub.writeRunSentinel(this.id, runRecord);
-      return result;
+      // ★ 收尾本身也必须防弹：它跑在 ACP 的异步回调里，一旦抛出去就是 unhandled
+      //   rejection —— Node ≥15 会直接杀掉进程，连带丢掉所有会话的活进程；
+      //   而且调用方会永远等不到哨兵。所以出错也要落一个"收尾异常"的哨兵。
+      try {
+        this.busy = false;
+        this.collector = null;
+        this.currentTool = null;
+        this.pushOut('turn', `第 ${this.currentTurn} 轮结束（${stopReason ?? 'unknown'}）`, {
+          phase: 'end',
+          stop_reason: stopReason,
+          error: failure ?? undefined,
+        });
+        this.turnCount += 1;
+        this.lastUsedAt = now();
+        this.#hub.save();
+        // 唤醒所有"等本轮结束"的插话请求（busy 已置 false，它们可以安全地发下一轮）
+        const waiters = this.idleWaiters;
+        this.idleWaiters = [];
+        for (const w of waiters) w();
+        const after = gitStatus(this.cwd);
+        const result = {
+          conversation_id: this.id,
+          run_id: runRecord.run_id,
+          stop_reason: stopReason,
+          error: failure,
+          answer: c.answer,
+          thinking: formatReasoning(c, reasoning),
+          thinking_stats: {
+            hidden: reasoning === 'hide' || reasoning === 'marker',
+            chars: c.reasoning.length,
+            chunks: c.reasoningChunks,
+            ms: c.reasoningStartedAt ? now() - c.reasoningStartedAt : 0,
+          },
+          tools_used: [...c.tools.values()],
+          usage: c.usage,
+          workspace_changed: before !== after,
+          diff_stat: after,
+          elapsed_ms: now() - t0,
+        };
+        runRecord.ended_at = now();
+        runRecord.elapsed_ms = result.elapsed_ms;
+        runRecord.status = failure ? 'error' : stopReason === 'cancelled' ? 'cancelled' : 'done';
+        runRecord.result = result;
+        // ★ 无条件写哨兵：**一个回合 = 一个哨兵文件**，没有例外。
+        //   之前只在"调用方没在原地等"时才写，于是插话那一轮没有哨兵 —— 调用方的
+        //   等待逻辑（等文件出现）就永远空等，即使 run 早已 status=done（真实事故）。
+        //   统一规则也消除了整类"有 run_id 却没有哨兵"的坑。
+        this.#hub.writeRunSentinel(this.id, runRecord);
+        return result;
+      } catch (e) {
+        this.#hub.log.info(`[conv ${this.id}] 回合收尾异常（已兜底）: ${e.message}`);
+        this.busy = false;
+        this.collector = null;
+        const waiters = this.idleWaiters;
+        this.idleWaiters = [];
+        for (const w of waiters) w();
+        const fallback = {
+          conversation_id: this.id,
+          run_id: runRecord.run_id,
+          stop_reason: 'error',
+          error: `回合收尾异常: ${e.message}`,
+          answer: c.answer ?? '',
+          thinking_stats: { hidden: true, chars: 0, chunks: 0, ms: 0 },
+          tools_used: [...(c.tools?.values?.() ?? [])],
+          workspace_changed: false,
+          elapsed_ms: now() - t0,
+        };
+        runRecord.ended_at = now();
+        runRecord.status = 'error';
+        runRecord.error = fallback.error;
+        runRecord.result = fallback;
+        this.#hub.writeRunSentinel(this.id, runRecord);
+        return fallback;
+      }
     };
 
     /** 没等到结果时给调用方的收据（它靠 run_id + 哨兵文件事后验收）。 */
@@ -1000,8 +1052,15 @@ export class Hub {
       });
       // 套用会话级配置（思考深度默认 max；ACP 自己的默认是 Provider default）
       conv.lastConfigApplied = await applySessionConfig(proc, res.sessionId, conv.cfg);
-      // 登记工作区，否则这些会话在你的 DSH GUI 里看不到
-      conv.workspace = registerWorkspace(cwd, res.sessionId);
+      // 登记工作区，否则这些会话在你的 DSH GUI 里看不到。
+      // ★ 必须容错：registerWorkspace 会写 workspace.json（磁盘满/被占时会抛），
+      //   而它在 this.conversations.set 之前 —— 抛出去就会**丢掉这个会话并泄漏进程**。
+      try {
+        conv.workspace = registerWorkspace(cwd, res.sessionId);
+      } catch (e) {
+        conv.workspace = { registered: false, error: e.message };
+        this.log.info(`[hub] 工作区登记失败（不影响会话可用）: ${e.message}`);
+      }
       this.conversations.set(conv.id, conv);
       this.save();
       this.log.info(
@@ -1064,18 +1123,24 @@ export class Hub {
   startReaper() {
     if (this.#reaper) return;
     this.#reaper = setInterval(async () => {
-      const cutoff = now() - IDLE_TTL_MS;
-      for (const c of this.conversations.values()) {
-        if (c.busy || !c.proc?.alive) continue;
-        // 还握着写锁的会话要续心跳：否则别的实例会把"活着但一时空闲"的我们
-        // 误判成卡死，进而去抢占我们持有的会话。
-        lockHeartbeat(c.id);
-        if (c.lastUsedAt > cutoff) continue;
-        this.log.info(`[hub] 空闲回收会话 ${c.id} 的进程（可 resume 复活）`);
-        const proc = c.proc;
-        c.proc = null;
-        removeMarker(c.id);
-        await proc.stop().catch(() => {});
+      // ★ 整个回收周期必须自带防护：这里抛出的异常会变成 unhandled rejection，
+      //   在 Node ≥15 上直接**杀掉进程** —— 而那会连带丢掉所有会话的活进程。
+      try {
+        const cutoff = now() - IDLE_TTL_MS;
+        for (const c of this.conversations.values()) {
+          if (c.busy || !c.proc?.alive) continue;
+          // 还握着写锁的会话要续心跳：否则别的实例会把"活着但一时空闲"的我们
+          // 误判成卡死，进而去抢占我们持有的会话。
+          lockHeartbeat(c.id);
+          if (c.lastUsedAt > cutoff) continue;
+          this.log.info(`[hub] 空闲回收会话 ${c.id} 的进程（可 resume 复活）`);
+          const proc = c.proc;
+          c.proc = null;
+          removeMarker(c.id);
+          await proc.stop().catch(() => {});
+        }
+      } catch (e) {
+        this.log.info(`[hub] 回收周期异常（已忽略，下个周期继续）: ${e.message}`);
       }
     }, REAP_INTERVAL_MS);
     this.#reaper.unref?.();

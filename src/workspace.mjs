@@ -255,8 +255,10 @@ export function backfillWorkspaces({ includeTemp = false, dryRun = false, pruneM
  * @param {object} opts
  * @param {boolean} [opts.tempOnly] 只删临时目录下的。自动清理（测试套件收尾）用这条，
  *   绝不动桌面或真实项目里的任何会话。
+ * @param {boolean} [opts.idsOnly] **只删 ids 里点名的**，忽略上面两条规则。
+ *   要精确删某几个会话时用这条（否则一条临时目录规则会把别的也一起带走 —— 真实踩过）。
  */
-export function purgeTestSessions({ dryRun = false, ids = [], tempOnly = false } = {}) {
+export function purgeTestSessions({ dryRun = false, ids = [], tempOnly = false, idsOnly = false } = {}) {
   const explicit = new Set(ids);
   const victims = [];
   if (existsSync(SESSIONS_ROOT)) {
@@ -277,7 +279,8 @@ export function purgeTestSessions({ dryRun = false, ids = [], tempOnly = false }
         const isTemp = isTempPath(cwd);
         const isTestDesktop = !tempOnly && /[\\/]Desktop[\\/]dsh-mcp-test-[AB]([\\/]|$)/i.test(cwd);
         const isExplicit = explicit.has(header.id);
-        if (!isTemp && !isTestDesktop && !isExplicit) continue;
+        // idsOnly：只认点名，别的规则全部作废
+        if (idsOnly ? !isExplicit : !isTemp && !isTestDesktop && !isExplicit) continue;
         victims.push({
           id: header.id,
           dir,

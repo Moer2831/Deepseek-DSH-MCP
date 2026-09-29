@@ -64,3 +64,10 @@ async function shutdown(signal) {
 process.on('SIGINT', () => shutdown('SIGINT'));
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.stdin.on('end', () => shutdown('stdin EOF'));
+
+// 一个后台路径的 Promise 拒绝不该让整个服务死掉（那会连带丢掉所有会话的活进程）。
+// 记一行就继续。**故意不接管 uncaughtException**：同步未捕获异常意味着状态不可知，
+// 让它崩掉更干净 —— 会话本体都在磁盘上，重启后会 resume。
+process.on('unhandledRejection', (e) => {
+  log.info(`[dsh-mcp] 未处理的 Promise 拒绝（已忽略，服务继续）: ${e?.message ?? e}`);
+});

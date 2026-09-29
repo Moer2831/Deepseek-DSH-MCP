@@ -195,7 +195,172 @@ try {
     check('后台那一轮的哨兵也落地了', existsSync(bgSent), bgSent);
   }
 
-  console.log('\n[4] 收尾');
+  // ── [4] 抢占与状态的边界 ─────────────────────────────────────
+  console.log('\n[4] 抢占与状态的边界情况');
+
+  const stSelf = await B.callTool('dsh_status', { conversation_id: conv });
+  check('B 持有期间 lock_holder=self', stSelf?.structuredContent?.lock_holder === 'self', JSON.stringify(stSelf?.structuredContent?.lock_holder));
+
+  const tkSelf = await B.callTool('dsh_takeover', { conversation_id: conv }, 120_000);
+  check('对"自己已持有"的会话抢占 → 直接说无需抢占', tkSelf?.structuredContent?.ok === true && /已经持有/.test(tkSelf?.structuredContent?.message ?? ''), JSON.stringify(tkSelf?.structuredContent ?? {}).slice(0, 240));
+
+  const tkUnknown = await B.callTool('dsh_takeover', { conversation_id: 'no-such-conversation' }, 60_000);
+  check('抢占一个不存在的会话 → 清晰 isError', tkUnknown?.isError === true && /未知会话/.test(McpClient.text(tkUnknown)), McpClient.text(tkUnknown).slice(0, 160));
+
+  // 交还（不 forget）→ 进程停掉、写锁释放、登记必须被删
+  const rel = await B.callTool('dsh_release', { conversation_id: conv }, 60_000);
+  check('交还会话成功', rel?.structuredContent?.closed === true || rel?.structuredContent?.released === true || !rel?.isError, McpClient.text(rel).slice(0, 160));
+  const markerFile = join(LOCKS, `${conv}.json`);
+  check('★ 交还后持有者登记被删掉（否则会被误报成孤儿）', !existsSync(markerFile), markerFile);
+
+  const stAfter = await B.callTool('dsh_status', { conversation_id: conv });
+  check('交还后 lock_holder 回到 none', stAfter?.structuredContent?.lock_holder === 'none', JSON.stringify(stAfter?.structuredContent?.lock_holder));
+
+  const tkFree = await B.callTool('dsh_takeover', { conversation_id: conv }, 240_000);
+  check('★ 锁空着时抢占 = 正常 resume（不杀任何东西）', tkFree?.structuredContent?.ok === true && tkFree?.structuredContent?.killed_pid === null, JSON.stringify(tkFree?.structuredContent ?? {}).slice(0, 260));
+  check('且说明里讲清了"无需抢占"', /无需抢占/.test(tkFree?.structuredContent?.message ?? ''), String(tkFree?.structuredContent?.message).slice(0, 200));
+
+  const listB = await B.callTool('dsh_list', {});
+  check('dsh_list 报出 orphan_holders 字段', Array.isArray(listB?.structuredContent?.orphan_holders), JSON.stringify(listB?.structuredContent?.orphan_holders));
+  check('（此刻没有孤儿持有者）', (listB?.structuredContent?.orphan_holders ?? []).length === 0, JSON.stringify(listB?.structuredContent?.orphan_holders));
+
+  // ── [5] 哨兵不变量：**每一个回合都有哨兵** ────────────────────
+  console.log('\n[5] ★ 哨兵不变量（一个回合 = 一个哨兵）');
+
+  // (a) wait=true 的内联回合也要写 —— 旧实现只有"调用方没原地等"才写
+  const inline = await B.callTool('dsh_send', { conversation_id: conv, prompt: '只回复：内联', wait: true, timeout_ms: 300_000 }, 360_000);
+  const inlineRun = inline?.structuredContent?.run_id;
+  check('内联回合返回 run_id', typeof inlineRun === 'string', JSON.stringify(inlineRun));
+  const inlineSent = join(ROOT, 'runs', conv, `${inlineRun}.json`);
+  check('★ 内联（wait=true）回合的哨兵也落盘了', existsSync(inlineSent), inlineSent);
+
+  // (b) 会话空闲时插话（走 interject 的 'idle' 分支）也要写
+  await sleep(500);
+  const ijIdle = await B.callTool('dsh_interject', { conversation_id: conv, mode: 'queue', message: '只回复：空闲插话' }, 360_000);
+  const idleS = ijIdle?.structuredContent ?? {};
+  check('空闲插话返回 sentinel_file', !!idleS.sentinel_file, JSON.stringify(idleS).slice(0, 240));
+  check('★ 空闲插话那一轮的哨兵也落盘了', !!idleS.sentinel_file && existsSync(idleS.sentinel_file), String(idleS.sentinel_file));
+
+  // ── [6] 登记模块的边界（单元）─────────────────────────────────
+  console.log('\n[6] 登记模块的边界（单元）');
+  rmSync(LOCKS, { recursive: true, force: true });
+  check('目录不存在时 listOrphans() 返回空数组', locks.listOrphans().length === 0);
+  check('目录不存在时 pruneDeadMarkers() 不报错', locks.pruneDeadMarkers().removed === 0);
+
+  mkdirSync(LOCKS, { recursive: true });
+  writeFileSync(join(LOCKS, 'broken.json'), '{ not valid json', 'utf8');
+  check('登记文件损坏 → classifyHolder 当成无登记', locks.classifyHolder('broken').kind === 'none');
+  const prunedBroken = locks.pruneDeadMarkers();
+  check('损坏的登记会被清掉', prunedBroken.removed >= 1, JSON.stringify(prunedBroken));
+  check('清理后文件没了', !existsSync(join(LOCKS, 'broken.json')));
+
+  // ★ 回归：writeMarker 绝不覆盖"别人还活着的"登记（实现期真实踩到的 bug）
+  const alivePid = process.ppid;
+  writeRawMarker('c-guard', {
+    conversation_id: 'c-guard',
+    mcp_pid: alivePid,
+    mcp_token: 'other-live-instance',
+    child_pid: alivePid,
+    heartbeat_at: Date.now(),
+  });
+  const wrote = locks.writeMarker('c-guard', { childPid: alivePid, cwd: ROOT });
+  const afterGuard = JSON.parse(readFileSync(join(LOCKS, 'c-guard.json'), 'utf8'));
+  check('★★ writeMarker 拒绝覆盖活着的外来登记', wrote === false, JSON.stringify(wrote));
+  check('★★ 外来登记的 token 原样保留（抢占要靠它判"谁持有"）', afterGuard.mcp_token === 'other-live-instance', afterGuard.mcp_token);
+
+  // 但过期的外来登记应该可以被我们接管（覆盖）
+  writeRawMarker('c-stale-ok', {
+    conversation_id: 'c-stale-ok',
+    mcp_pid: 999999,
+    mcp_token: 'dead-instance',
+    child_pid: 999999,
+    heartbeat_at: Date.now() - 10 * 60 * 1000,
+  });
+  const wroteStale = locks.writeMarker('c-stale-ok', { childPid: alivePid, cwd: ROOT });
+  const afterStale = JSON.parse(readFileSync(join(LOCKS, 'c-stale-ok.json'), 'utf8'));
+  check('过期的外来登记可以被接管（覆盖）', wroteStale === true, JSON.stringify(wroteStale));
+  check('覆盖后 token 是我们自己的', afterStale.mcp_token === locks.MCP_TOKEN, afterStale.mcp_token);
+
+  // ── [8] 两条真实边界：崩溃 vs 卡死 ────────────────────────────
+  console.log('\n[8a] 崩溃：杀掉 MCP → 子进程跟着退出 → 锁**自动释放**（不会留孤儿）');
+  const STATE2 = join(ROOT, 'state2.json');
+  const A2 = new McpClient({ env: { DSH_MCP_STATE: STATE2 } }).start();
+  await A2.initialize();
+  const ws2 = join(ROOT, 'ws2');
+  mkdirSync(ws2, { recursive: true });
+  const st2 = await A2.callTool('dsh_start', { cwd: ws2, permission: 'danger-full-access' }, 180_000);
+  const conv2 = st2?.structuredContent?.conversation_id;
+  check('新实例 A2 建好会话', !!conv2, McpClient.text(st2).slice(0, 140));
+  await A2.callTool('dsh_send', { conversation_id: conv2, prompt: '只回复：边界', wait: true, timeout_ms: 300_000 }, 360_000);
+
+  const m2 = JSON.parse(readFileSync(join(LOCKS, `${conv2}.json`), 'utf8'));
+  const holderPid = m2.child_pid;
+  check('登记里有子进程 PID', typeof holderPid === 'number', JSON.stringify(m2));
+
+  // 只杀 MCP 服务进程本身（不动进程树）
+  const a2pid = A2.pid;
+  process.kill(a2pid, 'SIGKILL');
+  await sleep(2500);
+  check('MCP 服务进程已被强杀', !locks.isPidAlive(a2pid), String(a2pid));
+  // ★ 关键事实：子进程的 stdio 是连着父进程的管道，父进程一死管道关闭、子进程见 EOF 自杀。
+  //   所以**崩溃不会留下握着锁的孤儿** —— 这是好消息，也解释了为什么"重启 MCP"总能拿回锁。
+  check('★ 子进程随父进程一起退出（锁已自动释放）', !locks.isPidAlive(holderPid), String(holderPid));
+  check('登记被判为"锁已释放"（none）', locks.classifyHolder(conv2).kind === 'none', locks.classifyHolder(conv2).reason);
+
+  const B2 = new McpClient({ env: { DSH_MCP_STATE: STATE2 } }).start();
+  await B2.initialize();
+  const r2b = await B2.callTool('dsh_send', { conversation_id: conv2, prompt: '只回复：接管崩溃会话', wait: true, timeout_ms: 300_000 }, 360_000);
+  check('★ 新的 MCP 实例无需抢占即可直接接管', r2b?.structuredContent?.stop_reason === 'end_turn', McpClient.text(r2b).slice(0, 240));
+  check('拿到的是新实例的答复', /接管崩溃会话/.test(r2b?.structuredContent?.answer ?? ''), JSON.stringify(r2b?.structuredContent?.answer));
+
+  // ── [8b] 卡死：持有者活着但失联（心跳过期）→ stale-mcp → **无 force 自动抢占** ──
+  console.log('\n[8b] ★ 卡死：持有者活着但心跳过期 → 判为 stale-mcp → 无 force 自动抢占');
+  // 让 B2 持有 conv2（它刚刚 resume 过），记下它的子进程
+  const m3 = JSON.parse(readFileSync(join(LOCKS, `${conv2}.json`), 'utf8'));
+  const wedgedPid = m3.child_pid;
+  check('B2 登记了新的子进程', typeof wedgedPid === 'number' && wedgedPid !== holderPid, JSON.stringify(m3));
+
+  // 制造"持有者 MCP 失联"：登记里 MCP 进程**仍在**（用一个确定活着的外部 PID），
+  // 但心跳是十分钟前的 —— 这正是"活着但卡死"的形态。进程本身不动。
+  writeRawMarker(conv2, {
+    conversation_id: conv2,
+    mcp_pid: process.ppid,
+    mcp_token: 'wedged-instance',
+    child_pid: wedgedPid,
+    cwd: ws2,
+    heartbeat_at: Date.now() - 10 * 60 * 1000,
+  });
+  const holder3 = locks.classifyHolder(conv2);
+  check('★ 判定为 stale-mcp（失联的持有者）', holder3.kind === 'stale-mcp', holder3.reason);
+  check('判定理由点名"心跳已过期"', /心跳.*过期|卡死/.test(holder3.reason), holder3.reason);
+
+  // 第三个实例（同一注册表）撞锁 → 报错必须是"孤儿/可安全抢占"
+  const C = new McpClient({ env: { DSH_MCP_STATE: STATE2 } }).start();
+  await C.initialize();
+  const rC = await C.callTool('dsh_send', { conversation_id: conv2, prompt: '你好', wait: false }, 180_000);
+  const tC = McpClient.text(rC);
+  check('★ C 撞锁并指出可安全抢占', /写锁|占用/.test(tC) && /dsh_takeover/.test(tC), tC.slice(0, 300));
+  check('★ 且明确说"无需 force"', /无需 force|即可|直接/.test(tC), tC.slice(0, 300));
+
+  const tkC = await C.callTool('dsh_takeover', { conversation_id: conv2 }, 240_000);
+  const tkCs = tkC?.structuredContent ?? {};
+  check('★★ 无 force 抢占成功（失联持有者可自动接管）', tkCs.ok === true, JSON.stringify(tkCs).slice(0, 400));
+  check('★★ 杀掉的正是那个失联持有者的 PID', tkCs.killed_pid === wedgedPid, `${tkCs.killed_pid} vs ${wedgedPid}`);
+  check('失联持有者的子进程确实死了', !locks.isPidAlive(wedgedPid), String(wedgedPid));
+
+  const rCc = await C.callTool('dsh_send', { conversation_id: conv2, prompt: '只回复：接管卡死', wait: true, timeout_ms: 300_000 }, 360_000);
+  check('★★ 抢占后 C 能正常派活', rCc?.structuredContent?.stop_reason === 'end_turn', McpClient.text(rCc).slice(0, 240));
+  check('拿到的是接管后的答复', /接管卡死/.test(rCc?.structuredContent?.answer ?? ''), JSON.stringify(rCc?.structuredContent?.answer));
+
+  // 收尾：B2 的子进程已被 C 杀掉，两边都释放
+  for (const cl of [B2, C]) {
+    try {
+      await cl.callTool('dsh_release', { conversation_id: conv2, forget: true }, 60_000);
+    } catch {}
+    await cl.close();
+  }
+
+  console.log('\n[9] 收尾');
   for (const c of [A, B]) {
     try {
       await c.callTool('dsh_release', { conversation_id: conv, forget: true }, 60_000);

@@ -61,12 +61,18 @@ function readJson(file) {
   }
 }
 
-/** 原子写（tmp + rename），避免读到半截。 */
+/** 原子写（tmp + rename），避免读到半截。**写失败绝不影响主流程**（登记只是辅助信息）。 */
 function writeJson(file, obj) {
-  mkdirSync(dirname(file), { recursive: true });
-  const tmp = `${file}.tmp.${process.pid}.${Math.random().toString(36).slice(2)}`;
-  writeFileSync(tmp, JSON.stringify(obj, null, 2), 'utf8');
-  renameSync(tmp, file);
+  try {
+    mkdirSync(dirname(file), { recursive: true });
+    const tmp = `${file}.tmp.${process.pid}.${Math.random().toString(36).slice(2)}`;
+    writeFileSync(tmp, JSON.stringify(obj, null, 2), 'utf8');
+    renameSync(tmp, file);
+    return true;
+  } catch {
+    // 磁盘满 / 目录被占 / 权限问题都不该让 MCP 服务出问题
+    return false;
+  }
 }
 
 /** 登记"我这个 MCP 进程为这个会话拉起了哪个 DSH 子进程"。 */

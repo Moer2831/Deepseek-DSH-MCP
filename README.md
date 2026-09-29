@@ -6,7 +6,7 @@
 
 An MCP server that drives DSH as a **long-lived agent runtime** instead of wrapping a CLI. Open a conversation, hand it a goal, and it writes code, runs scripts and spawns its own subagents — while you watch, cut in, and collect the result whenever you like. 🛠️
 
-🧪 339 checks green · 🔌 MCP over stdio · 📜 MIT · 💬 Community: [linux.do](https://linux.do/)
+🧪 394 checks green · 🔌 MCP over stdio · 📜 MIT · 💬 Community: [linux.do](https://linux.do/)
 
 > 📌 **Read the [Usage Notes](USAGE-NOTES.en.md) first** — the practical gotchas that will actually bite you: the ACP model-config trap, external MCP tools bypassing DSH's sandbox, the workspace/GUI registry cache, cost control, and a troubleshooting table.
 
@@ -280,14 +280,15 @@ The suite **cleans up after itself**: `run.mjs` always ends with `cleanup.mjs`, 
 | `integration` | 30 | resume-with-memory across processes, interrupt, both interject modes |
 | `async` | 16 | fire-and-forget + later collection |
 | `sentinel` | 36 | completion sentinel: atomicity, latch semantics, per-conversation namespacing under concurrency, cancelled runs still land it, and **reasoning never reaching the file** |
-| `lock` | 39 | **write lock and preemption**: lease-error detection, four holder classifications, orphan discovery; **end-to-end** with two real MCP instances fighting over one conversation → clear error → refusal → `force` takeover → usable afterwards; plus a regression proving **interject rounds write a sentinel** |
-| `timeout` | 34 | **timeout semantics**: `wait=false` is unaffected by `timeout_ms`; a `wait=true` expiry merely downgrades to background (turn not cancelled, result not lost, `busy` never lies); `timeout_ms=0` waits forever; a failed resume invalidates the process instead of wedging the conversation |
+| `prune` | 11 | **sentinel retention**: prunes over-age and crash-leftover files, keeps fresh ones, removes empty shells, `TTL=0` disables pruning, and never touches the conversation registry beside it (no tokens, runs every time) |
+| `timeout` | 38 | **timeout semantics**: `wait=false` is unaffected by `timeout_ms`; a `wait=true` expiry merely downgrades to background (turn not cancelled, result not lost, `busy` never lies); `timeout_ms<=0` waits forever; a failed resume invalidates the process instead of wedging the conversation; an empty prompt yields a clear error |
+| `lock` | 79 | **write lock and preemption**: four holder classifications, `writeMarker` never overwriting a live holder, malformed/missing registration edge cases; **end-to-end** with two real MCP instances fighting over one conversation → clear error → refusal → `force` takeover; **a crash releases the lock automatically**, **a wedged holder is preempted without `force`**; plus the "one turn, one sentinel" invariant (inline turns and idle interjects included) |
 | `concurrency` | 31 | three simultaneous conversations + live incremental reads |
 | `capability` | 22 | writing code, running scripts, **spawning its own subagents** (verified on disk via child session headers) |
 | `workspace-effect` | 24 | workspace actually effective when no path is given |
 | `acceptance` | 36 | two folders × two conversations doing a read-only IDA Pro analysis |
 
-**Total: 339 checks, all green.**
+**Total: 394 checks, all green.** (358 in-suite + 36 acceptance)
 
 ## 🔒 The write lock: one writer per conversation at a time
 
@@ -301,9 +302,11 @@ A DSH session directory carries a **cross-process write lock** whose semantics a
 | `lock_holder` | Meaning | Preemption |
 |---|---|---|
 | `self` | this process holds it | nothing to do |
-| `stale-mcp` | **our own leftover orphan** (the MCP died/restarted but its child still holds the lock) | ✅ **killed and taken over automatically** (safe) |
+| `stale-mcp` | **the holder is alive but went silent** (no heartbeat for 90 s — typically that MCP is wedged) | ✅ **killed and taken over automatically** (safe) |
 | `live-mcp` | another **live** dsh-mcp instance is using it | ⚠️ refused by default; `force=true` takes it |
 | `none` | no registration — **most likely your own DSH GUI has it open** | ❌ **never killed** (that would kill your whole UI, including the conversation you're reading), reported only |
+
+> **Crash vs. wedge (measured)**: `SIGKILL` the MCP server and its DSH children **exit with it** — their stdio is a pipe to the parent, so closing it gives them EOF and they shut down. **A crash therefore releases the lock automatically; it never leaves an orphan holding it** (a restart always gets it back). What `stale-mcp` really covers is "**the holder is alive but wedged**" (heartbeat expired) — that's the case worth preempting.
 
 > **Operational rule**: don't open a conversation this server drives in your DSH GUI. To look at it there, `dsh_release` first; dispatch again afterwards (it resumes automatically).
 >
@@ -314,7 +317,7 @@ A DSH session directory carries a **cross-process write lock** whose semantics a
 1. **No token-level streaming into model context** — an MCP limitation, not DSH's. Callers get per-step results; humans can follow progress via stderr logs.
 2. **True mid-turn steering is impossible** — ACP rejects concurrent prompts (`a prompt is already in flight for this session`). `dsh_interject` is the practical equivalent: cancel, then immediately start a new turn, history preserved.
 3. **Image prompts are unsupported** — ACP advertises `promptCapabilities: {image: false}`.
-4. **`dsh_send` blocks by default** — use `wait=false` for long tasks, then wait on the completion sentinel file (`sentinel_file`) for a poll-free "done" notification. The service pushes no MCP notifications; the "notification" is the sentinel file plus the caller's background waiter.
+4. **Restarting the MCP server takes its children with it** — when this service is restarted or killed, the DSH children it spawned exit too (their stdio is a pipe to us): **in-flight turns are interrupted and no sentinel lands** (judge by inspecting the workspace, don't just wait for the file). The good news: the **write lock is released automatically**, so a restart always gets it back. The service also pushes no MCP notifications; "completion notification" is the sentinel file plus the caller's background waiter.
 5. **A conversation that dies before its first successful turn may never have materialized on disk** — resume then fails with a clear error. Safe after the first message.
 6. **No renaming** — DSH's title subsystem has no external rename API (`SessionTitleService.rename` requires a live in-process session). Titles are auto-generated from the first message.
 7. **`session/list` returns only `{sessionId, cwd}` and excludes already-open sessions** — titles are filled in by this server from DSH's projection cache.

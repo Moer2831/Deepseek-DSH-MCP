@@ -245,7 +245,9 @@ Profile = `~/.dsh/profiles/<name>/`，由 `package.json` 的 `dsh.profile.bundle
 - **为什么需要**：DSH 的 `SessionWriteLease` 是 Windows 命名内核信号量，**持有者活着就永不过期**，且**没有 API 能从活进程手里夺走** —— 唯一手段是杀掉持有者进程。既然要杀，就必须先判定那是谁。
 - **登记**：一个会话一个文件 `<状态目录>/locks/<会话id>.json`，内容 `{mcp_pid, mcp_token, child_pid, cwd, spawned_at, heartbeat_at}`。`mcp_token` 防 PID 复用；`heartbeat_at` 由 reaper 周期刷新。
 - **四类判定**（`locks.classifyHolder`）：`self`（自己）/ `stale-mcp`（MCP 已死或心跳过期 → 可安全抢占的孤儿）/ `live-mcp`（另一活着的实例）/ `none`（无登记，多半是用户的 GUI）。
-- **不覆盖原则**：`writeMarker` **绝不覆盖"别人还活着的"登记**。否则一次注定失败的 resume 会先把线索盖掉、再在失败路径删掉，抢占逻辑就把持有者误判成 `none`（实现期真实踩到）。
+- **登记时机 = 拿到锁之后**：`writeMarker` 只在 `session/resume` **成功之后**调用，而不是 spawn 完就写。语义是"**我正持有**"而不是"我拉起了进程" —— 否则一次注定撞锁失败的 resume 会先把"谁持有"的线索覆盖掉、失败路径再删掉，抢占逻辑就只能看到 `none`（实现期真实踩到两次）。
+- **不覆盖原则**：`writeMarker` **绝不覆盖"别人还活着的"登记**（额外一层保险）；`removeMarker` 默认只删自己的（校验 token）。
+- **★ 崩溃不会留孤儿（实测结论）**：子进程的 stdio 是连着父进程的管道，`SIGKILL` MCP → 管道关闭 → 子进程见 EOF 自杀 → **锁自动释放**。所以 `stale-mcp` 真正对应的是"**持有者活着但卡死**"（心跳过期），而不是"崩溃残留"。（代价：崩溃时进行中的回合会中断且**哨兵不会落地**，只能靠核对工作区状态。）
 - **两条独立 spawn 路径都要登记**：`ensureAlive()` **和** `Hub.create()` —— 新建会话走后者，漏登记会让"本服务自己持有的会话"被判成 `none` 而拒绝抢占（同样真实踩到）。
 - **错误翻译**：`SessionAlreadyOwnedError` 不是 `RequestError`，ACP 把它包成 `-32603 "Internal error"` 并把真实原因放 `error.data`；本服务取出 `data`，识别 `already owned` / `writer-held` / 中文「已被占用」，转成"谁持有 + 该怎么办"。
 - **绝不杀 GUI**：GUI 会话跑在 `dsh web` 单进程内（非一会话一进程），杀它 = 整个界面 + 该进程全部 GUI 会话一起断。因此 `none` 分支只报告不动手。

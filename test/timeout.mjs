@@ -152,8 +152,10 @@ try {
   convs.push(convB);
   await client.callTool('dsh_send', { conversation_id: convB, prompt: '只回复：在', wait: true, timeout_ms: 0 }, 300_000);
   await client.callTool('dsh_release', { conversation_id: convB });
-  // 把这条会话从磁盘上删掉，再派活 → resume 必然失败
-  purgeTestSessions({ ids: [convB] });
+  // 把这条会话从磁盘上删掉，再派活 → resume 必然失败。
+  // ⚠️ 必须用 idsOnly：否则"临时目录"那条规则会把同批次的其它会话（比如 convA）一起删掉，
+  //    后面的用例就会莫名其妙失败（本测试真的踩过这个坑）。
+  purgeTestSessions({ ids: [convB], idsOnly: true });
   check('会话文件已删除（构造 resume 失败）', true);
 
   const bad1 = await client.callTool('dsh_send', { conversation_id: convB, prompt: '随便', wait: false }, 180_000);
@@ -168,7 +170,39 @@ try {
   const stB2 = await client.callTool('dsh_status', { conversation_id: convB });
   check('重派后依然不留半死进程', stB2?.structuredContent?.alive === false, McpClient.text(stB2).slice(0, 200));
 
-  console.log('\n[6] 收尾');
+  console.log('\n[6] 参数边界：负 timeout / 空 prompt');
+  // timeout_ms 为负数应等同"不设超时"（代码里是 timeoutMs <= 0 → 一直等），
+  // 必须正常拿到结果，而不是立刻转后台或报错。
+  const neg = await client.callTool(
+    'dsh_send',
+    { conversation_id: convA, prompt: '只回复：负超时', wait: true, timeout_ms: -5 },
+    300_000,
+  );
+  check('★ 负 timeout_ms 等同不设超时，返回完整结果', neg?.structuredContent?.still_running !== true, JSON.stringify(neg?.structuredContent ?? {}).slice(0, 200));
+  check('负 timeout_ms 的回合正常结束', neg?.structuredContent?.stop_reason === 'end_turn', String(neg?.structuredContent?.stop_reason));
+
+  // 空 prompt：不该挂住、不该崩；要么正常回合，要么给出清晰错误
+  const empty = await client.callTool(
+    'dsh_send',
+    { conversation_id: convA, prompt: '', wait: true, timeout_ms: 120_000 },
+    180_000,
+  );
+  const emptyText = McpClient.text(empty);
+  check(
+    '★ 空 prompt 不挂住、不崩（有结果或清晰 isError）',
+    empty?.isError === true || empty?.structuredContent?.stop_reason !== undefined,
+    emptyText.slice(0, 220),
+  );
+  // 就算 DSH 拒绝空输入，也必须是**说人话**的失败，而不是我们自己的笼统错误
+  const emptyErr = empty?.structuredContent?.error ?? '';
+  check(
+    '★ 空 prompt 的失败信息不是 Internal error（要么有话说，要么干脆没有）',
+    empty?.isError !== true || !/Internal error/i.test(emptyText),
+    emptyText.slice(0, 220),
+  );
+  console.log(`    空 prompt 的结果: ${empty?.isError ? 'isError' : `stop_reason=${empty?.structuredContent?.stop_reason}`}${emptyErr ? ` err=${String(emptyErr).slice(0, 120)}` : ''}`);
+
+  console.log('\n[7] 收尾');
   for (const id of convs) await client.callTool('dsh_release', { conversation_id: id, forget: true });
   check('已释放', true);
 } catch (e) {
