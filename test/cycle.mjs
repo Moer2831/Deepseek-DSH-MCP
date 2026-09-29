@@ -128,7 +128,8 @@ try {
   // 独立实例：TTL=0（永不回收）+ 极快扫描间隔，若语义仍是"立即回收"，子进程会被秒收。
   const STATE2 = join(ROOT, 'state-ttl0.json');
   const keep = new McpClient({
-    env: { ...ENV, DSH_MCP_STATE: STATE2, DSH_MCP_IDLE_TTL_MS: '0' },
+    // 扫描间隔调小，好在几秒内观察到"心跳有没有续"
+    env: { ...ENV, DSH_MCP_STATE: STATE2, DSH_MCP_IDLE_TTL_MS: '0', DSH_MCP_REAP_INTERVAL_MS: '800' },
   }).start();
   await keep.initialize();
   const ws2 = join(ROOT, 'ws-keep');
@@ -147,6 +148,36 @@ try {
   check('★ 会话仍然是 alive（一直握着写锁 → GUI 抢不走）', stKeep?.structuredContent?.alive === true, JSON.stringify(stKeep?.structuredContent?.alive));
   check('★ lock_holder 仍是 self', stKeep?.structuredContent?.lock_holder === 'self', JSON.stringify(stKeep?.structuredContent?.lock_holder));
   check('登记还在（别人查得到"锁在我们手上"）', !!readMarkerSafe(conv2), 'marker 存在');
+
+  // ★ 心跳在 TTL=0 模式下也必须继续：心跳一停，别的实例 90 秒后就会把我们判成"卡死"
+  //   并用 dsh_takeover **杀掉我们的子进程**（多实例场景真实风险）。
+  const hb1 = readMarkerSafe(conv2)?.heartbeat_at;
+  await sleep(3500);
+  const hb2 = readMarkerSafe(conv2)?.heartbeat_at;
+  check('★ TTL=0 时心跳仍在续（否则会被别的实例误判成卡死并抢占）', typeof hb2 === 'number' && hb2 > hb1, `${hb1} → ${hb2}`);
+
+  // ★ 正在跑回合时也必须续心跳：旧实现先 `if (c.busy) continue` 再续心跳，
+  //   于是长回合（>90 秒）期间心跳不刷新 → 别的实例可以合法地"抢占"并杀掉这一轮。
+  const hb3 = readMarkerSafe(conv2)?.heartbeat_at;
+  const longRun = await keep.callTool(
+    'dsh_send',
+    { conversation_id: conv2, prompt: '先运行 Start-Sleep -Seconds 4 再回复"长回合完"。' },
+    180_000,
+  );
+  check('长回合已派出（后台）', !!longRun?.structuredContent?.run_id, JSON.stringify(longRun?.structuredContent ?? {}).slice(0, 160));
+  await sleep(3000);
+  const hb4 = readMarkerSafe(conv2)?.heartbeat_at;
+  check('★★ 回合进行中心跳也在续（修掉了"长回合被别的实例误杀"）', typeof hb4 === 'number' && hb4 > hb3, `${hb3} → ${hb4}`);
+  // 等它跑完，避免带着 busy 收尾
+  let waited = 0;
+  while (waited < 120_000) {
+    const st = await keep.callTool('dsh_status', { conversation_id: conv2 });
+    if (st?.structuredContent?.busy === false) break;
+    await sleep(2000);
+    waited += 2000;
+  }
+  check('长回合已结束', true, `waited=${waited}ms`);
+
   await keep.callTool('dsh_release', { conversation_id: conv2, forget: true }, 60_000);
   await keep.close();
 

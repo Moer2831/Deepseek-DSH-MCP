@@ -51,6 +51,17 @@ export function isTempPath(p) {
 }
 
 /**
+ * 是否是"测试用桌面目录"。
+ *
+ * 覆盖两类命名（都是本仓库测试自己造的，绝不会碰到真实项目）：
+ *   - `Desktop\dsh-mcp-test-A|B`（验收/工作区效果测试）
+ *   - `Desktop\dsh-conc-A|B|C`（并发测试）
+ */
+export function isTestDesktopPath(p) {
+  return /[\\/]Desktop[\\/](dsh-mcp-test-[AB]|dsh-conc-[ABC])([\\/]|$)/i.test(String(p ?? ''));
+}
+
+/**
  * 是否该登记这个工作区。
  * 模式（DSH_MCP_REGISTER_WORKSPACE）：project（默认，跳过系统临时目录）| all | 0（关闭）
  */
@@ -344,6 +355,30 @@ export function pruneEmptyWorkspaces({ dryRun = false } = {}) {
     const gone = !existsSync(ws?.path ?? '');
     if (!empty || !gone) continue;
     removed.push({ id, path: ws.path });
+    delete doc.tables.workspaces[id];
+    doc.global.workspaceIds = (doc.global.workspaceIds ?? []).filter((x) => x !== id);
+    if (doc.global.defaultWorkspaceId === id) doc.global.defaultWorkspaceId = null;
+  }
+  if (!dryRun) writeDoc(doc);
+  return { removed };
+}
+
+/**
+ * 清理：把**测试用**的工作区条目从注册表移除（临时的 + 桌面上的测试目录，如 `Desktop\dsh-conc-*`）。
+ *
+ * 为什么需要它：测试会在桌面和临时目录里造工作区，跑完删掉文件夹，但**注册表条目会留下** ——
+ * 于是每跑一次全量测试，你的 GUI 侧栏就多几个空壳 ✗（`pruneEmptyWorkspaces` 靠"无会话且路径不存在"
+ * 启发式，实测不一定兜住）。这里按**路径模式**确定性清理，绝不碰真实项目目录。
+ */
+export function pruneTestWorkspaces({ dryRun = false } = {}) {
+  const doc = readDoc();
+  const removed = [];
+  for (const id of Object.keys(doc.tables.workspaces)) {
+    const ws = doc.tables.workspaces[id];
+    const p = ws?.path ?? '';
+    if (!p) continue;
+    if (!isTempPath(p) && !isTestDesktopPath(p)) continue;
+    removed.push({ id, path: p, sessions: ws?.sessionIds?.length ?? 0 });
     delete doc.tables.workspaces[id];
     doc.global.workspaceIds = (doc.global.workspaceIds ?? []).filter((x) => x !== id);
     if (doc.global.defaultWorkspaceId === id) doc.global.defaultWorkspaceId = null;

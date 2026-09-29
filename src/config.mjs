@@ -142,16 +142,20 @@ export const PROMPT_TIMEOUT_MS = Number(process.env.DSH_MCP_PROMPT_TIMEOUT_MS ??
 export const REQUEST_TIMEOUT_MS = Number(process.env.DSH_MCP_REQUEST_TIMEOUT_MS ?? 60_000);
 
 /**
- * 会话空闲多久后回收其 DSH 进程（毫秒）。回收不等于丢弃——会话可用 resume 复活。
+ * 会话空闲多久后回收其 DSH 进程（毫秒）。
  *
- * ★ 设为 `0` = **永不回收**（推荐给"我会在 GUI 里看进度"的用户）：
- *   本服务会一直握着写锁，于是 GUI 抢不走它 —— GUI 那边只会看到一个显式、无害的
- *   「已被占用」提示，而本服务的任务照跑、之后也照常接回。
- *   （反过来：一旦回收把锁空出来，你在 web 里点开那条会话，`dsh web` 会**永久**持有写锁，
- *    切走/等待/归档都不释放，本服务之后每一次 resume 都会失败。）
- *   代价：每个会话常驻一个 DSH 进程。
+ * ★★ **默认 `0` = 永不回收**（MCP 一直握着写锁，GUI 抢不走）。
+ *   为什么默认如此：空闲回收是写锁**唯一**会变空的时刻，而锁一空，用户在 web 里点开那条
+ *   会话就会让 `dsh web` **永久**持有它（实测：切走 ✗ 等待 ✗ 归档 ✗ 都不释放），
+ *   本服务之后每一次 resume 都失败 —— 这正是"任务跑完后接不回去"的成因。
+ *   不回收时（实测）：**你在 GUI 里点开那条会话是"只读打开"** —— 你照样能看到内容 ✓，
+ *   而写锁留在本服务手里 ✓（用独立实例探测确认过：持有者是本服务的 PID、心跳新鲜）。
+ *   也就是"**你看得见，我们写得动**"，两边都不受影响。
+ *   代价：每个会话常驻一个 DSH 进程（例如 10 个会话约 1~3 GB）。
+ *   想省内存就设成毫秒数（如 `300000` = 5 分钟），但那就回到了"锁可能被 GUI 抢走"的世界。
+ *   （无论哪种模式，锁心跳都会一直续 —— 否则别的实例会误判我们卡死并抢占。）
  */
-export const IDLE_TTL_MS = Number(process.env.DSH_MCP_IDLE_TTL_MS ?? 5 * 60 * 1000);
+export const IDLE_TTL_MS = Number(process.env.DSH_MCP_IDLE_TTL_MS ?? 0);
 
 /** 后台回收扫描间隔（毫秒）。 */
 export const REAP_INTERVAL_MS = Number(process.env.DSH_MCP_REAP_INTERVAL_MS ?? 30_000);

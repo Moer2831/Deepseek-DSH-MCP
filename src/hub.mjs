@@ -274,11 +274,11 @@ export class Conversation {
       //   下次调用会走上面 `this.proc?.alive` 的快路径，把 session/prompt 发给一个
       //   不认识该会话的进程 —— 会话就永久卡死了（重派也不会自愈）。
       this.proc = null;
-      try {
-        proc.stop();
-      } catch {
-        /* 已经死了就无所谓 */
-      }
+      // ★ 必须 **await**：不等它真的退出，紧接着的 classifyHolder 就会把"正在退出的自己人"
+      //   当成持锁者（表现为"上一代子进程还活着并握着锁"），于是每次失败都误报锁冲突 ——
+      //   更糟的是旧代码没有 lastChildPid 兜底，会把这种自伤报成"多半是你自己的 GUI"，
+      //   而 dsh_takeover 对 none 又拒绝接管，会话就卡住了（test/cycle.mjs 实测抓到）。
+      await proc.stop().catch(() => {});
       // 只删**自己的**登记（removeMarker 会校验 token）；别人的登记必须留着当线索
       removeMarker(this.id);
       // 写锁冲突是最常见也最需要"说人话"的失败：DSH 的 SessionAlreadyOwnedError 会被
@@ -1221,18 +1221,23 @@ export class Hub {
 
   /** 空闲回收：停掉闲置进程，会话本身保留（可 resume 复活）。
    *
-   * ★ `DSH_MCP_IDLE_TTL_MS=0` 表示**永不回收**（不是"立即回收"）。
-   *   这是一个真实可用的策略，不只是开关：**只要本服务还握着写锁，GUI 就抢不走它**。
-   *   实测（见 USAGE-NOTES §3.10/3.11）：一旦空闲回收把子进程收掉、锁空出来，
-   *   你在这时去 web 里点开那条会话，`dsh web` 会**永久**持有写锁（切走、等待、归档都不释放），
-   *   于是本服务之后每一次 resume 都失败 —— 用户看到的正是"任务跑完后接不回去"。
-   *   不回收 = 把"静默的永久损坏"换成"GUI 侧一个显式、无害的『已被占用』提示"。
-   *   代价是每个会话常驻一个 DSH 进程（内存），这本来就是回收机制存在的理由。 */
+   * ★ `DSH_MCP_IDLE_TTL_MS=0`（**默认**）= **永不回收**。
+   *   理由（实测，见 USAGE-NOTES §3.10~3.12）：空闲回收是写锁**唯一**会变空的时刻，
+   *   而只要锁一空，你在 web 里点开那条会话，`dsh web` 就会**永久**持有它
+   *   （切走 ✗ 等待 ✗ 归档 ✗ 都不释放），本服务之后每一次 resume 都失败 ——
+   *   用户看到的正是"任务跑完后接不回去"。不回收 = **本服务一直握着写锁，GUI 抢不走**：
+   *   实测你在 GUI 里点开它是**只读打开**（照样能看内容 ✓），写锁仍在我们的 PID 上 ✓ ——
+   *   即"**你看得见，我们写得动**"，两边都不受影响。
+   *   代价是每个会话常驻一个 DSH 进程（内存）—— 想省内存就把它设成毫秒数（如 300000）。
+   *
+   * ★ 但**心跳必须一直续**，两种模式都一样：心跳停了，别的实例 90 秒后就会把我们
+   *   判成"卡死"，`dsh_takeover` 于是会**杀掉我们正在跑的回合**。
+   */
   startReaper() {
     if (this.#reaper) return;
-    if (IDLE_TTL_MS === 0) {
-      this.log.info('[hub] DSH_MCP_IDLE_TTL_MS=0：不回收空闲进程（会话会一直握着写锁，GUI 抢不走）');
-      return;
+    const neverReap = IDLE_TTL_MS === 0;
+    if (neverReap) {
+      this.log.info('[hub] DSH_MCP_IDLE_TTL_MS=0：不回收空闲进程（一直握着写锁，GUI 抢不走）；仍会续心跳');
     }
     this.#reaper = setInterval(async () => {
       // ★ 整个回收周期必须自带防护：这里抛出的异常会变成 unhandled rejection，
@@ -1240,10 +1245,11 @@ export class Hub {
       try {
         const cutoff = now() - IDLE_TTL_MS;
         for (const c of this.conversations.values()) {
-          if (c.busy || !c.proc?.alive) continue;
-          // 还握着写锁的会话要续心跳：否则别的实例会把"活着但一时空闲"的我们
-          // 误判成卡死，进而去抢占我们持有的会话。
+          if (!c.proc?.alive) continue;
+          // ★ 先续心跳，**包括正在跑回合的**：否则长回合（>90 秒）期间心跳不刷新，
+          //   别的实例会把我们判成失联并抢占，直接把这一轮杀掉。
           lockHeartbeat(c.id);
+          if (neverReap || c.busy) continue;
           if (c.lastUsedAt > cutoff) continue;
           this.log.info(`[hub] 空闲回收会话 ${c.id} 的进程（可 resume 复活）`);
           const proc = c.proc;

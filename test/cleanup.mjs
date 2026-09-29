@@ -19,6 +19,7 @@ import {
   listWorkspaces,
   pruneEmptyWorkspaces,
   pruneTempWorkspaces,
+  pruneTestWorkspaces,
   purgeTestSessions,
 } from '../src/workspace.mjs';
 
@@ -37,6 +38,12 @@ if (purged.victims.length > 10) log(`    …还有 ${purged.victims.length - 10}
 // 2) 临时目录的工作区登记
 const tempWs = pruneTempWorkspaces({ dryRun });
 log(`  临时工作区登记：删除 ${tempWs.removed.length} 个`);
+
+// 2b) ★ 测试用的工作区登记（桌面 `dsh-conc-*` 之类）—— 只删文件夹不删登记的话，
+//     每跑一次全量测试就会在你的 GUI 侧栏里多留几个空壳
+const testWs = pruneTestWorkspaces({ dryRun });
+log(`  测试工作区登记：删除 ${testWs.removed.length} 个`);
+for (const w of testWs.removed.slice(0, 8)) log(`    - ${w.path}`);
 
 // 3) 空工作区（无会话且路径已不存在）
 const emptyWs = pruneEmptyWorkspaces({ dryRun });
