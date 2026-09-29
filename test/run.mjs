@@ -30,6 +30,9 @@ if (code === 0 && all) {
   code = await run('async.mjs');
 }
 if (code === 0 && all) {
+  code = await run('sentinel.mjs');
+}
+if (code === 0 && all) {
   code = await run('concurrency.mjs');
 }
 if (code === 0 && all) {

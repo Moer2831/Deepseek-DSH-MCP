@@ -221,13 +221,24 @@ Profile = `~/.dsh/profiles/<name>/`，由 `package.json` 的 `dsh.profile.bundle
 | # | 功能 | 说明 |
 |---|---|---|
 | B1 | 发任务（阻塞） | 发 prompt，等到 `session.status = idle`（或 `turn/end`）再返回结果 |
-| B2 | 发任务（异步） | 立即返回 `run_id`，调用方自行轮询 |
+| B2 | 发任务（异步） | 立即返回 `run_id` + `sentinel_file`；回合终止时原子写出含最终结果的哨兵文件（见 B9），调用方用文件系统等待"跑完自动通知"，无需轮询 |
 | B3 | 游标增量读取 | `read(run_id, cursor)` → 自上次以来的黑色正文 + 工具事件 + 新 cursor（"流式"的落地形态） |
 | B4 | 打断 | 停止当前回合（协议无中断方法，实现路径见 Q3） |
 | B5 | 运行状态 | `idle/running`、当前 turn/step、正在跑哪个工具 |
 | B6 | 用量计量 | `tokenUsage.totals` / `contextPressure` / `contextWindow`，让调用方能管预算 |
 | B7 | 回合排队 | 同会话内串行排队（DSH 单会话单回合），避免并发踩踏 |
 | B8 | 上下文注入 | `contentBlocks` 支持文本与图片；支持 DSH 的 `@路径` 引用语法把文件带进会话 |
+| B9 | 异步完成哨兵 | `wait=false` 的 run 终止（done/error/cancelled）时，往 `<RUNS_DIR>/<conversation_id>/<run_id>.json` 原子写出含 `status`+`result` 的文件；调用方（Claude/Codex）用后台任务 `until [ -f ]` 等它出现即被唤醒，无需轮询、也不占轮次 |
+
+**B9 设计要点（并发正确性）**：本服务在 MCP 协议上只应答请求、**不主动推通知**，"跑完通知"由哨兵文件 + 调用方后台等待任务共同实现。
+- **按会话分目录**：`run_id` 序号是每会话独立计数的，不同会话可能同毫秒生成同名 `run_id`；`<conversation_id>/` 前缀使其各写各的、不串台。会话内 `dsh_send` 忙时直接拒绝、序号单调，故会话内唯一。
+- **闩锁语义**：文件写一次并保留 —— 即使 run 在等待任务启动前就完成，`[ -f ]` 也立刻为真，不漏。
+- **原子落地**：`tmp`(带 pid+随机后缀) + `rename`，存在即完整；每个 run 独立 tmp，并发写互不覆盖（**刻意不复用** `save()` 那个共享 `${STATE_FILE}.tmp`）。
+- **自带结果**：内存 run 记录只留最近 `MAX_RUNS` 条、并发多 run 时会被挤掉；哨兵内含 `result`，收活读文件即可，不依赖内存、且扛服务重启。
+- **隐私（唯一的落盘例外）**：哨兵必须带上正文，调用方才能离线收活——所以它是本项目**唯一**会把对话内容写到磁盘的地方。但 `result.thinking` 默认被**剥掉**并置 `thinking_omitted: true`（`sanitizeResultForSentinel`），维持"思考不落盘"的总体保证；要连思考一起落盘必须显式设 `DSH_MCP_SENTINEL_INCLUDE_REASONING=1`。测试 `test/sentinel.mjs` 专门守这一点：请求 `reasoning=full` 时哨兵原文里不得出现思考文本，而同一 run 在内存（`dsh_get`）里仍可见。
+- **留存**：哨兵是闩锁、不会自行消失，且内含正文，故服务**启动时**按 `DSH_MCP_SENTINEL_TTL_MS`（默认 7 天）清理过期哨兵与崩溃残留的 `.tmp`（`pruneSentinels`）。只在启动做一次，因此绝不会误删"当前正在等待的"哨兵。
+- **给调用方的便利**：返回值同时给出 `sentinel_file_posix`（`D:\a\b` → `/d/a/b`）。手工转换 Windows 路径是等待任务白等到超时最常见的原因。
+- **落点**：`tools.dsh_send` 的 `wait=false` 分支在 `.then`/`.catch` 各调一次 `hub.writeRunSentinel()`（覆盖所有终止态）；`createRun` 起跑前 `clearRunSentinel()` 防御历史残留。
 
 ### C. 输出与思考控制（用户点名要的"默认隐藏思考内容"）
 
@@ -329,8 +340,8 @@ Profile = `~/.dsh/profiles/<name>/`，由 `package.json` 的 `dsh.profile.bundle
 
 | 工具 | 主要入参 | 返回 |
 |---|---|---|
-| `dsh_send` | `conversation_id, prompt, wait?, timeout_ms?, reasoning?, output?, max_chars?` | `{run_id, status, answer, thinking_stats, tools_used, diff, usage, cursor}` |
-| `dsh_run` | 同上但 `wait=false` 语义 | `{run_id}` |
+| `dsh_send` | `conversation_id, prompt, wait?, timeout_ms?, reasoning?, output?, max_chars?` | `wait=true`：`{run_id, status, answer, thinking_stats, tools_used, diff, usage, cursor}`；`wait=false`：`{run_id, accepted, background, sentinel_file}`（完成哨兵见 B9） |
+| `dsh_run` | 同上但 `wait=false` 语义 | `{run_id, sentinel_file}` |
 | `dsh_read` | `run_id, cursor?, reasoning?` | `{status, text_delta, events, cursor, done}` |
 | `dsh_status` | `conversation_id` | `{status, turn, step, current_tool}` |
 | `dsh_interrupt` | `conversation_id` | `{interrupted}` |

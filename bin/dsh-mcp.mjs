@@ -22,6 +22,13 @@ const log = createLogger();
 const hub = new Hub({ log });
 hub.load();
 hub.startReaper();
+// 启动时清一次过期哨兵（哨兵内含正文，长期不清理会无声堆积）
+const prunedSentinels = hub.pruneSentinels();
+if (prunedSentinels.pruned) {
+  log.info(
+    `[dsh-mcp] 启动清理：删除 ${prunedSentinels.pruned} 个过期哨兵、${prunedSentinels.dirs_removed} 个空目录`,
+  );
+}
 
 const server = createMcpServer({ hub, log });
 server.start();

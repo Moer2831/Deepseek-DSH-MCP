@@ -92,7 +92,7 @@ node test/smoke.mjs        # no LLM calls, verifies the whole plumbing
 | Tool | What it does |
 |---|---|
 | `dsh_start` | Create a conversation: workspace, permission tier, approval policy, **reasoning effort (default `max`)**, model |
-| `dsh_send` | Hand it a task. `wait=true` (default) blocks until the turn ends; **`wait=false` returns a `run_id` immediately** |
+| `dsh_send` | Hand it a task. `wait=true` (default) blocks until the turn ends; **`wait=false` returns a `run_id` and a `sentinel_file`** (atomically written when the turn ends, containing the final result — lets you wait for completion via the filesystem, no polling) |
 | `dsh_list` | All conversations with live state: `running` / `idle` / `detached`, elapsed time, current tool, output so far. `only_running=true` for active ones |
 | `dsh_read` | **Cursor-based incremental read** of what a *running* conversation is producing right now |
 | `dsh_get` | Conversation details; with `run_id`, the **final result of that dispatch** (the "collect the result later" entry point) |
@@ -122,7 +122,34 @@ MCP tool calls **block**. If you let `dsh_send` wait for a 10-minute task, your 
      → status=done, elapsed=20.3s, full answer
 ```
 
-`run_id` is the receipt. Run records are **memory-only, last 20 kept**; for anything durable, persist it yourself or drain `dsh_read`.
+`run_id` is the receipt. Run records are **memory-only, last 20 kept**; under many concurrent runs old ones get evicted and `dsh_get` will fail — which is exactly why the completion sentinel below carries the result.
+
+## Workflow: get notified on completion (no polling)
+
+Besides `run_id`, `wait=false` returns a **`sentinel_file`** path plus **`sentinel_file_posix`** (the Bash/MSYS form — use it directly; hand-converting Windows paths is the easiest way to make your waiter hang until timeout). When the turn ends — **whether it succeeds, fails, or is cancelled** — the service **atomically writes** a small file there containing the final `status` and `result`. So you neither poll nor block: **wait for that file with a background task in your own host (Claude/Codex); the moment it appears, you're woken up.**
+
+```bash
+# sent="$sentinel_file_posix"   ← copy it straight from the tool result
+sent='/d/AI_MCP/DSH_MCP/.state/runs/<conversation_id>/<run_id>.json'
+dl=$(( $(date +%s) + 2100 ))          # 35min safety net so a dead service can't hang you forever
+until [ -f "$sent" ]; do
+  [ "$(date +%s)" -ge "$dl" ] && { echo "TIMEOUT"; exit 1; }
+  sleep 2
+done
+echo "DONE"                            # task exits → host wakes you → read the file to collect
+```
+
+Once the file exists: **read it** for `status` and `result` (preferred — immune to the in-memory window and survives restarts), or use `dsh_get(conversation_id, run_id)`.
+
+Design notes (especially under **concurrent multi-session** use):
+
+- **No cross-talk**: the path is `.state/runs/<conversation_id>/<run_id>.json`, namespaced by conversation. `run_id` sequence numbers are counted per-conversation, so two conversations *can* mint the same `run_id` in the same millisecond — the per-conversation directory keeps them apart. Arm one background task per run; each completes and wakes you independently.
+- **Latch semantics**: the file is written once and kept. Even if the run finishes *before* you arm the waiter, `[ -f ]` is immediately true — you never miss it.
+- **Atomic write**: `tmp` + `rename`; if the file exists its contents are complete. Each run uses its own tmp, so concurrent writes never clobber.
+- **No server push**: the service only answers requests over MCP (it sends no notifications). "Completion notification" is entirely the sentinel file plus your background waiter.
+- **★ No reasoning in the sentinel**: the payload carries the answer and thinking *statistics* only — `result.thinking` is stripped and replaced by `thinking_omitted: true`, because the project's rule is that reasoning never reaches disk. `dsh_get(run_id)` still returns it from memory while the record lives. `DSH_MCP_SENTINEL_INCLUDE_REASONING=1` breaks that guarantee deliberately.
+
+> Cleanup: sentinels contain full answers, so the service **prunes sentinels older than 7 days at startup** (tune with `DSH_MCP_SENTINEL_TTL_MS`; `0` disables). Your waiter should still `rm` the file after consuming it.
 
 ## Workflow: many conversations at once
 
@@ -191,7 +218,13 @@ Silent by default — **not one byte is written**.
 | `debug` | more of our own events; still no DSH output |
 | `DSH_MCP_LOG_STDERR=1` | additionally forward DSH's raw stderr (**may contain reasoning**) |
 
-**Reasoning never persists**: not in logs, not on disk. The state file holds metadata only (id, cwd, permissions, counters) — a smoke-test assertion guards this. (DSH itself writes its own session log under `~/.dsh/sessions`; that is what makes resume possible and is outside this server's control.)
+**Reasoning never reaches disk** — with exactly one deliberate exception:
+
+- Not in logs (silent by default), and the state file holds metadata only (id, cwd, permissions, counters) — a smoke-test assertion guards this.
+- **The async completion sentinel does persist the answer** (it must, so a caller can collect offline) but **strips `result.thinking`** and marks `thinking_omitted: true`. A test asserts that even when `reasoning=full` is requested, no reasoning text appears in the sentinel — while `dsh_get(run_id)` still returns it from memory. Set `DSH_MCP_SENTINEL_INCLUDE_REASONING=1` to break this on purpose.
+- Sentinels are pruned after 7 days by default (`DSH_MCP_SENTINEL_TTL_MS`; `0` keeps them forever).
+
+(DSH itself writes its own session log under `~/.dsh/sessions`; that is what makes resume possible and is outside this server's control.)
 
 ## Environment variables
 
@@ -200,6 +233,9 @@ Silent by default — **not one byte is written**.
 | `DSH_BIN` | auto-detected | Path to `@deepseek-ai/dsh/lib/bin.js` |
 | `DSH_MCP_PROFILE` | `dsh-mcp` | DSH profile to drive |
 | `DSH_MCP_STATE` | `<repo>/.state/conversations.json` | Conversation registry, survives restarts |
+| `DSH_MCP_RUNS_DIR` | `<state file dir>/runs` | Root for async completion sentinels (`<this>/<conversation_id>/<run_id>.json`) |
+| `DSH_MCP_SENTINEL_TTL_MS` | `604800000` (7 days) | Startup pruning age for sentinels; `0` disables pruning |
+| `DSH_MCP_SENTINEL_INCLUDE_REASONING` | unset | `1` writes `result.thinking` into the sentinel (**breaks the never-on-disk guarantee**) |
 | `DSH_MCP_PERMISSION` | `danger-full-access` | Default tier for `dsh_start` |
 | `DSH_MCP_REASONING_EFFORT` | `max` | Default reasoning effort |
 | `DSH_MCP_IDLE_TTL_MS` | `300000` | Idle before a conversation's process is reaped (still resumable) |
@@ -222,19 +258,20 @@ node test/run.mjs --all    # everything
 | `boundary` | 42 | protocol edges (double initialize, malformed lines, unknown method), argument validation, unknown ids, cursor edges, lifecycle idempotence, unicode |
 | `integration` | 30 | resume-with-memory across processes, interrupt, both interject modes |
 | `async` | 16 | fire-and-forget + later collection |
+| `sentinel` | 36 | completion sentinel: atomicity, latch semantics, per-conversation namespacing under concurrency, cancelled runs still land it, and **reasoning never reaching the file** |
 | `concurrency` | 31 | three simultaneous conversations + live incremental reads |
 | `capability` | 22 | writing code, running scripts, **spawning its own subagents** (verified on disk via child session headers) |
 | `workspace-effect` | 24 | workspace actually effective when no path is given |
 | `acceptance` | 36 | two folders × two conversations doing a read-only IDA Pro analysis |
 
-**Total: 229 checks, all green.**
+**Total: 265 checks, all green.**
 
 ## Known limitations
 
 1. **No token-level streaming into model context** — an MCP limitation, not DSH's. Callers get per-step results; humans can follow progress via stderr logs.
 2. **True mid-turn steering is impossible** — ACP rejects concurrent prompts (`a prompt is already in flight for this session`). `dsh_interject` is the practical equivalent: cancel, then immediately start a new turn, history preserved.
 3. **Image prompts are unsupported** — ACP advertises `promptCapabilities: {image: false}`.
-4. **`dsh_send` blocks by default** — use `wait=false` for long tasks.
+4. **`dsh_send` blocks by default** — use `wait=false` for long tasks, then wait on the completion sentinel file (`sentinel_file`) for a poll-free "done" notification. The service pushes no MCP notifications; the "notification" is the sentinel file plus the caller's background waiter.
 5. **A conversation that dies before its first successful turn may never have materialized on disk** — resume then fails with a clear error. Safe after the first message.
 6. **No renaming** — DSH's title subsystem has no external rename API (`SessionTitleService.rename` requires a live in-process session). Titles are auto-generated from the first message.
 7. **`session/list` returns only `{sessionId, cwd}` and excludes already-open sessions** — titles are filled in by this server from DSH's projection cache.

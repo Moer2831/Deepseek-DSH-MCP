@@ -15,6 +15,7 @@ import { mkdirSync, existsSync, readFileSync, rmSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { McpClient } from './mcp-client.mjs';
+import { pruneEmptyWorkspaces, purgeTestSessions } from '../src/workspace.mjs';
 
 let pass = 0;
 let failCount = 0;
@@ -135,11 +136,8 @@ try {
     );
   }
 
-  console.log('\n[8] 收尾（保留文件作为证据，只释放会话进程）');
+  console.log('\n[8] 收尾（释放会话进程；文件夹与会话记录的清理见 finally）');
   for (const j of convs) await client.callTool('dsh_release', { conversation_id: j.id });
-  console.log(`    证据文件保留在:`);
-  for (const j of convs) console.log(`      ${join(j.dir, j.file)}`);
-  console.log(`    清理命令: node bin/dsh-mcp-workspaces.mjs --purge-test-sessions`);
 } catch (e) {
   failCount++;
   console.log(`\n✗ 异常中断: ${e.message}\n${e.stack}`);
@@ -147,6 +145,20 @@ try {
 } finally {
   await client.close();
   try { rmSync(STATE, { force: true }); } catch {}
+  // 默认自清理：不把测试文件夹和会话留在别人的桌面与 GUI 里。
+  // 需要保留证据（人工查看文件）时设 DSH_MCP_KEEP_EVIDENCE=1。
+  if (process.env.DSH_MCP_KEEP_EVIDENCE === '1') {
+    console.log('\n证据文件已保留（DSH_MCP_KEEP_EVIDENCE=1）:');
+    for (const j of JOBS) console.log(`  ${join(j.dir, j.file)}`);
+  } else {
+    for (const j of JOBS) {
+      try { rmSync(j.dir, { recursive: true, force: true }); } catch {}
+    }
+    // 会话已在上面 release 过；这里精确删掉它们的会话记录并让注册表对账
+    purgeTestSessions({ ids: convs.map((c) => c.id).filter(Boolean) });
+    pruneEmptyWorkspaces();
+    console.log('\n已清理测试文件夹、会话与工作区登记（保留证据请设 DSH_MCP_KEEP_EVIDENCE=1）');
+  }
 }
 
 console.log(`\n===== 工作区有效性测试：通过 ${pass}，失败 ${failCount} =====`);

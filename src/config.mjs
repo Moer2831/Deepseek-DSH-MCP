@@ -84,6 +84,48 @@ export const DSH_HOME = process.env.DSH_HOME ?? join(homedir(), '.dsh');
 export const STATE_FILE =
   process.env.DSH_MCP_STATE ?? join(PKG_ROOT, '.state', 'conversations.json');
 
+/**
+ * 异步派活"完成哨兵"文件的根目录。每个 run 终止时在这里写一个独立小文件，
+ * 供调用方用文件系统等待完成（无需轮询 MCP 工具）。默认与状态文件同目录下的 runs/。
+ * 路径实际为 <RUNS_DIR>/<conversation_id>/<run_id>.json —— 按会话分目录，
+ * 杜绝不同会话在同一毫秒生成同名 run_id 时相撞（run_id 的序号是每会话独立计数的）。
+ */
+export const RUNS_DIR = process.env.DSH_MCP_RUNS_DIR ?? join(dirname(STATE_FILE), 'runs');
+
+/**
+ * 哨兵文件里是否带上**思考内容**。
+ *
+ * 默认 **不带** —— 本项目的红线是"思考内容不落盘、不写日志"。哨兵的用途是
+ * "跑完了 + 拿结果"，正文（answer）与思考统计已足够；`result.thinking` 会被剥掉并
+ * 标记 `thinking_omitted: true`，避免调用方以为字段丢了。
+ *
+ * 确实需要把思考一并落盘时，设 DSH_MCP_SENTINEL_INCLUDE_REASONING=1（会打破上面那条保证）。
+ */
+export const SENTINEL_INCLUDE_REASONING = process.env.DSH_MCP_SENTINEL_INCLUDE_REASONING === '1';
+
+/**
+ * 哨兵文件的保留时长（毫秒）。服务**启动时**清理超过此时长的哨兵与残留 tmp。
+ * 默认 7 天；设为 0 关闭清理（哨兵将永久保留）。
+ *
+ * 为什么要清理：哨兵内含完整正文，长期不清理会无声地堆积占用磁盘。
+ */
+export const SENTINEL_TTL_MS = Number(
+  process.env.DSH_MCP_SENTINEL_TTL_MS ?? 7 * 24 * 60 * 60 * 1000,
+);
+
+/**
+ * 把 Windows 路径转成 Bash / MSYS 形式（`D:\a\b` → `/d/a/b`），非 Windows 原样返回。
+ *
+ * 存在的意义：调用方的后台等待任务通常跑在 Bash 里，而 sentinel_file 是 Windows 形式，
+ * 手工转换（盘符小写 + 反斜杠改斜杠）很容易写错 —— 写错就会一直等到超时。
+ */
+export function toPosixPath(p) {
+  if (process.platform !== 'win32' || typeof p !== 'string') return p;
+  const m = /^([A-Za-z]):[\\/](.*)$/.exec(p);
+  if (!m) return p.replace(/\\/g, '/');
+  return `/${m[1].toLowerCase()}/${m[2].replace(/\\/g, '/')}`;
+}
+
 /** 单条 prompt 的最长等待时间（毫秒）。DSH 干活可以很久，默认 30 分钟。 */
 export const PROMPT_TIMEOUT_MS = Number(process.env.DSH_MCP_PROMPT_TIMEOUT_MS ?? 30 * 60 * 1000);
 

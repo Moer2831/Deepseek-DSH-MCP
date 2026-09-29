@@ -13,6 +13,7 @@ import {
   PERMISSION_TIERS,
   REASONING_EFFORTS,
   REASONING_MODES,
+  toPosixPath,
 } from './config.mjs';
 
 const S = (props, required = []) => ({ type: 'object', properties: props, required, additionalProperties: false });
@@ -59,8 +60,10 @@ export const TOOL_DEFS = [
     name: 'dsh_send',
     description:
       '向会话派一个任务。默认（wait=true）阻塞到回合结束再返回最终答复；' +
-      '**长任务建议 wait=false**：立刻返回一个 run_id，你继续做别的事，稍后用 ' +
-      'dsh_get(conversation_id, run_id) 验收结果，或 dsh_read 中途查看输出。' +
+      '**长任务建议 wait=false**：立刻返回 run_id 与 sentinel_file，你继续做别的事。' +
+      'wait=false 时，回合结束（成功或失败）会在 sentinel_file 原子落地一个含最终结果的小文件——' +
+      '**推荐用后台任务（Bash run_in_background + `until [ -f sentinel_file ]`）等它，跑完自动通知你，无需轮询**；' +
+      '文件出现后读它即得结果，或用 dsh_get(conversation_id, run_id) 验收，dsh_read 可中途看输出。' +
       '默认隐藏思考内容（只返回正文 + 思考统计）。' +
       '若会话正在忙，本工具会报错——改用 dsh_interject 插话，或用 dsh_interrupt 先打断。',
     inputSchema: S(
@@ -271,6 +274,7 @@ export function createHandlers(hub) {
           .prompt(args.prompt, { ...opts, run })
           .then((r) => {
             conv.lastResult = r;
+            hub.writeRunSentinel(conv.id, run); // run.status/result 此时已由 prompt() 设定
             return r;
           })
           .catch((e) => {
@@ -278,15 +282,32 @@ export function createHandlers(hub) {
             run.ended_at = Date.now();
             run.error = e.message;
             conv.lastResult = { error: e.message, stop_reason: 'error', run_id: run.run_id };
+            hub.writeRunSentinel(conv.id, run); // 失败/异常路径同样落哨兵（覆盖所有终止态）
             return conv.lastResult;
           });
+        const sentinel = hub.runSentinelPath(conv.id, run.run_id);
+        const sentinelPosix = toPosixPath(sentinel);
         return {
-          structured: { conversation_id: conv.id, run_id: run.run_id, accepted: true, background: true },
+          structured: {
+            conversation_id: conv.id,
+            run_id: run.run_id,
+            accepted: true,
+            background: true,
+            sentinel_file: sentinel,
+            /** Bash/MSYS 形式（D:\a\b → /d/a/b）；非 Windows 等于 sentinel_file。 */
+            sentinel_file_posix: sentinelPosix,
+          },
           text:
-            `已在后台开始执行（run_id=${run.run_id}）。你现在可以继续做别的事，稍后：\n` +
-            `- dsh_get(conversation_id, run_id) 取最终结果（验收）\n` +
-            `- dsh_status(conversation_id) 看是否还在跑\n` +
-            `- dsh_read(conversation_id, cursor) 中途查看它当前吐出的内容`,
+            `已在后台开始执行（run_id=${run.run_id}）。你现在可以继续做别的事。\n\n` +
+            `【跑完自动通知，无需轮询】完成时（成功/失败/被取消）会原子写出这个文件（含最终结果，但**不含思考内容**）：\n` +
+            `  ${sentinel}\n` +
+            `直接用下面这个 Bash 形式路径，**不要手工转换**（写错会一直等到超时）：\n` +
+            `  ${sentinelPosix}\n` +
+            `推荐用后台任务等它出现，文件一到就会唤醒你：\n` +
+            `  Bash(run_in_background): sent="${sentinelPosix}"; \\\n` +
+            `    dl=$(( $(date +%s)+2100 )); until [ -f "$sent" ]; do [ $(date +%s) -ge $dl ] && { echo TIMEOUT; exit 1; }; sleep 2; done; echo DONE\n` +
+            `文件出现后：直接读它拿结果（推荐——不受内存窗口限制、还扛服务重启），或 dsh_get(conversation_id, run_id) 验收。\n` +
+            `消费完可以 rm 掉它。其它随时可用：dsh_status（是否在跑）、dsh_read（增量看输出）。`,
         };
       }
 

@@ -92,7 +92,7 @@ node test/smoke.mjs        # 不调用 LLM，验证整条管道
 | 工具 | 作用 |
 |---|---|
 | `dsh_start` | 建会话：工作区、权限档、审批策略、**思考深度（默认 `max`）**、模型 |
-| `dsh_send` | 派任务。`wait=true`（默认）阻塞到回合结束；**`wait=false` 立刻返回 `run_id`** |
+| `dsh_send` | 派任务。`wait=true`（默认）阻塞到回合结束；**`wait=false` 立刻返回 `run_id` 与 `sentinel_file`**（回合结束时原子落地、含最终结果，供文件系统等待"跑完自动通知"） |
 | `dsh_list` | 所有会话及运行状态：`running` / `idle` / `detached`，已跑时长、当前工具、本轮输出。`only_running=true` 只看活动会话 |
 | `dsh_read` | **游标式增量读**——看正在跑的会话此刻吐出了什么 |
 | `dsh_get` | 会话详情；带 `run_id` 时返回**那一次派活的完整结果**（"回头验收"的入口） |
@@ -122,7 +122,34 @@ MCP 工具调用是**阻塞**的。如果让 `dsh_send` 等一个 10 分钟的�
      → status=done, elapsed=20.3s, 完整答复
 ```
 
-`run_id` 是验收凭据。回合记录**只在内存、只留最近 20 条**；需要长期留存请自行落盘，或用 `dsh_read` 拉取。
+`run_id` 是验收凭据。回合记录**只在内存、只留最近 20 条**；并发跑很多 run 时旧记录会被挤掉，`dsh_get` 就会失败——这正是下面"完成哨兵"自带结果的原因。
+
+## 用法：跑完自动通知（不轮询）
+
+`wait=false` 除了 `run_id`，还会返回 **`sentinel_file`**（哨兵文件路径）以及 **`sentinel_file_posix`**（Bash/MSYS 形式，**直接用它，别无手工转换**——转错了等待任务会一直挂到超时）。回合结束时——**无论成功、失败还是被取消**——本服务都会往这个路径**原子写出**一个含最终 `status` 与 `result` 的小文件。于是你不用轮询、也不用傻等：**用你自己宿主（Claude/Codex）的后台任务等这个文件出现即可，文件一到就会唤醒你。**
+
+```bash
+# sent="$sentinel_file_posix"   ← 直接用工具返回里那个字段
+sent='/d/AI_MCP/DSH_MCP/.state/runs/<conversation_id>/<run_id>.json'
+dl=$(( $(date +%s) + 2100 ))          # 35min 兜底，防服务中途死掉时无限挂
+until [ -f "$sent" ]; do
+  [ "$(date +%s)" -ge "$dl" ] && { echo "TIMEOUT"; exit 1; }
+  sleep 2
+done
+echo "DONE"                            # 后台任务退出 → 宿主唤醒你 → 读文件收活
+```
+
+文件出现后：**直接读它**即得 `status` 和 `result`（推荐——不受内存窗口限制、还扛服务重启），或用 `dsh_get(conversation_id, run_id)` 验收。
+
+设计要点（尤其**多会话并发**）：
+
+- **不串台**：哨兵路径为 `.state/runs/<conversation_id>/<run_id>.json`，按会话分目录。`run_id` 的序号是每会话独立计数的，不同会话在同一毫秒可能生成同名 `run_id`——分目录后各写各的，绝不互相覆盖。每个 run 起一个独立后台任务即可，各自完成、各自唤醒。
+- **闩锁语义**：文件写一次并保留。即便 run 在你启动等待任务**之前**就已完成，`[ -f ]` 也立刻为真，不会漏。
+- **原子落地**：`tmp` + `rename`，文件一旦存在内容必然完整；每个 run 用独立 tmp，并发写互不干扰。
+- **无主动推送**：本服务在 MCP 协议上只应答请求、不发通知；"跑完通知"完全由这个哨兵文件 + 你的后台等待任务实现。
+- **★ 哨兵里没有思考内容**：载荷只含正文与思考**统计**；`result.thinking` 会被剥掉并置 `thinking_omitted: true`——本项目的红线是思考不落盘。`dsh_get(run_id)` 在内存里仍能看到它（记录还在时）。设 `DSH_MCP_SENTINEL_INCLUDE_REASONING=1` 可以故意打破这条保证。
+
+> 清理：哨兵内含完整正文，所以服务**启动时会清掉超过 7 天的哨兵**（用 `DSH_MCP_SENTINEL_TTL_MS` 调；`0` 关闭）。等待任务消费后仍建议自行 `rm`。
 
 ## 用法：同时控制多个会话
 
@@ -191,7 +218,13 @@ node bin/dsh-mcp-workspaces.mjs --purge-test-sessions   # 删测试会话（规�
 | `debug` | 更细的本服务事件；仍不打印 DSH 输出 |
 | `DSH_MCP_LOG_STDERR=1` | 额外转发 DSH 原始 stderr（**可能含思考内容**） |
 
-**思考内容不落任何地方**：不写日志、不落盘。状态文件只有元数据（id、cwd、权限、计数），冒烟测试里有一条断言专门守这个。（DSH 自己会在 `~/.dsh/sessions` 写会话日志，那是 resume 的依据，不在本服务控制范围内。）
+**思考内容不落盘**，只有一个**刻意留下**的例外：
+
+- 不写日志（默认静默）；状态文件只有元数据（id、cwd、权限、计数），冒烟测试里有一条断言专门守这个。
+- **异步完成哨兵需要把正文写进文件**（否则调用方无法离线收活），但 `result.thinking` 会被**剥掉**并置 `thinking_omitted: true`。测试里专门验证了：即使请求 `reasoning=full`，哨兵里也不出现任何思考文本——而同一 run 在内存（`dsh_get`）里仍能看到。设 `DSH_MCP_SENTINEL_INCLUDE_REASONING=1` 可刻意打破这条。
+- 哨兵默认 7 天后由启动清理删除（`DSH_MCP_SENTINEL_TTL_MS`，`0` 表示永久保留）。
+
+（DSH 自己会在 `~/.dsh/sessions` 写会话日志，那是 resume 的依据，不在本服务控制范围内。）
 
 ## 环境变量
 
@@ -200,6 +233,9 @@ node bin/dsh-mcp-workspaces.mjs --purge-test-sessions   # 删测试会话（规�
 | `DSH_BIN` | 自动探测 | `@deepseek-ai/dsh/lib/bin.js` 路径 |
 | `DSH_MCP_PROFILE` | `dsh-mcp` | 驱动用的 DSH profile |
 | `DSH_MCP_STATE` | `<仓库>/.state/conversations.json` | 会话注册表，跨重启存活 |
+| `DSH_MCP_RUNS_DIR` | `<状态文件同目录>/runs` | 异步完成哨兵的根目录（`<此目录>/<会话id>/<run_id>.json`） |
+| `DSH_MCP_SENTINEL_TTL_MS` | `604800000`（7 天） | 启动时清理超过此时长的哨兵；`0` 关闭清理 |
+| `DSH_MCP_SENTINEL_INCLUDE_REASONING` | 未设置 | `1` 会把 `result.thinking` 一并写进哨兵（**打破"思考不落盘"的保证**） |
 | `DSH_MCP_PERMISSION` | `danger-full-access` | `dsh_start` 未指定时的权限档 |
 | `DSH_MCP_REASONING_EFFORT` | `max` | 默认思考深度 |
 | `DSH_MCP_IDLE_TTL_MS` | `300000` | 空闲多久回收会话进程（仍可 resume） |
@@ -222,19 +258,21 @@ node test/run.mjs --all    # 全量
 | `boundary` | 42 | 协议边界（重复 initialize、脏行、未知方法）、参数校验、未知 id、游标边界、生命周期幂等、unicode |
 | `integration` | 30 | 跨进程 resume 与记忆、中断、两种插话 |
 | `async` | 16 | fire-and-forget + 事后验收 |
+| `sentinel` | 36 | 完成哨兵：原子性、闩锁语义、多会话并发不串台、被取消也落地、**思考不进文件** |
 | `concurrency` | 31 | 三会话并发 + 实时增量读 |
 | `capability` | 22 | 写代码、跑脚本、**自行派子代理**（用磁盘上的子会话头验证） |
 | `workspace-effect` | 24 | 不给路径时工作区是否真的生效 |
 | `acceptance` | 36 | 两个文件夹 × 两个会话做只读 IDA Pro 分析 |
 
-**合计 229 项检查，全绿。**
+**合计 265 项检查，全绿。**
 
 ## 已知限制
 
 1. **逐字流式进不了模型上下文** —— MCP 的固有限制，不是 DSH 的。调用方拿到的是分步结果；人能通过 stderr 日志跟进。
 2. **真·中途改向做不到** —— ACP 明确拒绝并发 prompt（`a prompt is already in flight for this session`）。`dsh_interject` 是实用等价物：取消 + 立刻开新回合，历史保留。
 3. **图片提示不支持** —— ACP 自报 `promptCapabilities: {image: false}`。
-4. **`dsh_send` 默认阻塞** —— 长任务用 `wait=false`。
+4. **`dsh_send` 默认阻塞** —— 长任务用 `wait=false`，再用完成哨兵文件（`sentinel_file`）做"跑完自动通知"，不必轮询。
+   本服务不会主动发 MCP 通知，"通知"靠哨兵文件 + 调用方的后台等待任务实现。
 5. **首次成功回合之前就死掉的会话可能尚未落盘** —— 此时 resume 会报清晰错误。发出第一条消息后就安全了。
 6. **不能改名** —— DSH 的标题子系统没有对外改名接口（`SessionTitleService.rename` 需要进程内的活会话）。标题一律由首条消息自动生成。
 7. **`session/list` 只返回 `{sessionId, cwd}`，且排除已打开的会话** —— 对话名由本服务从 DSH 投影缓存补全。

@@ -7,11 +7,23 @@
  *
  * 日志与持久化红线：
  *   - 会话状态文件只存元数据（id/cwd/权限/别名/计数），**不存任何对话内容**。
- *   - 思考内容既不落盘也不写日志。
+ *   - 思考内容不写日志；**默认也不落盘**。
+ *     - 唯一的落盘例外是"异步完成哨兵"：它需要带上结果正文（answer）才能让调用方离线收活，
+ *       所以正文会写进 `<RUNS_DIR>/...`。但思考内容默认会被**剥掉**
+ *       （需 DSH_MCP_SENTINEL_INCLUDE_REASONING=1 才一并写入，那会打破本保证）。
  */
 
-import { mkdirSync, readFileSync, writeFileSync, existsSync, renameSync, statSync } from 'node:fs';
-import { dirname, isAbsolute } from 'node:path';
+import {
+  mkdirSync,
+  readFileSync,
+  writeFileSync,
+  existsSync,
+  renameSync,
+  statSync,
+  rmSync,
+  readdirSync,
+} from 'node:fs';
+import { dirname, isAbsolute, join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import {
   APPROVAL_POLICIES,
@@ -22,6 +34,9 @@ import {
   PROMPT_TIMEOUT_MS,
   REAP_INTERVAL_MS,
   REASONING_EFFORTS,
+  RUNS_DIR,
+  SENTINEL_INCLUDE_REASONING,
+  SENTINEL_TTL_MS,
   STATE_FILE,
   defaultApprovalPolicy,
 } from './config.mjs';
@@ -78,6 +93,18 @@ async function applySessionConfig(proc, sessionId, cfg) {
     await set('model', JSON.stringify([cfg.provider, cfg.model]), `模型=${cfg.provider}/${cfg.model}`);
   }
   return { applied, failed };
+}
+
+/**
+ * 哨兵文件里的 result 是否要剥离思考内容。
+ * 默认剥离以维持"思考不落盘"的保证，并留下 thinking_omitted 标记，
+ * 免得调用方以为字段是意外丢失的。
+ */
+function sanitizeResultForSentinel(result) {
+  if (!result || typeof result !== 'object') return result ?? null;
+  if (SENTINEL_INCLUDE_REASONING) return result;
+  const { thinking, ...rest } = result;
+  return thinking ? { ...rest, thinking_omitted: true } : rest;
 }
 
 export class Conversation {
@@ -468,6 +495,8 @@ export class Conversation {
     };
     this.runs.push(run);
     if (this.runs.length > MAX_RUNS) this.runs.shift();
+    // 防御性清残留：正常情况下该 run_id 从未用过，但确保等待方不会被历史哨兵误触发。
+    this.#hub.clearRunSentinel(this.id, run.run_id);
     return run;
   }
 
@@ -617,6 +646,97 @@ export class Hub {
       renameSync(tmp, STATE_FILE);
     } catch (e) {
       this.log.info(`[hub] 状态保存失败: ${e.message}`);
+    }
+  }
+
+  // ── 异步完成哨兵 ────────────────────────────────────────────────
+  //
+  // 一个 run 终止（done/error/cancelled）时写一个独立小文件，让调用方能用
+  // 文件系统等待完成（Bash run_in_background + `until [ -f ]`），无需轮询 MCP 工具。
+  //
+  // 并发正确性要点：
+  //   - 路径按 conversation_id 分目录 → 不同会话即使同毫秒生成同名 run_id 也不串台；
+  //     同一会话内 dsh_send 忙时直接拒绝、run 序号单调递增，故会话内 run_id 唯一。
+  //   - tmp + rename 原子落地 → 文件一旦存在，内容必然完整（等待方不会读到半截）；
+  //     每个 run 用自己带 pid/随机后缀的 tmp，绝不共用同一个 tmp（避免并发写互相覆盖）。
+  //   - 闩锁语义 → 文件写一次并保留：即便 run 在等待方启动前就已完成，`[ -f ]` 立刻为真。
+  //   - 文件内含最终 result → 收活可直接读文件，不依赖内存里的 run 记录
+  //     （内存只留最近 MAX_RUNS 条，并发多 run 时旧记录会被挤掉；文件不受此限，还扛服务重启）。
+
+  /** 某个 run 的完成哨兵文件路径。 */
+  runSentinelPath(conversationId, runId) {
+    return join(RUNS_DIR, conversationId, `${runId}.json`);
+  }
+
+  /** 写完成哨兵（原子）。失败只记日志，绝不影响主流程。 */
+  writeRunSentinel(conversationId, run) {
+    try {
+      const file = this.runSentinelPath(conversationId, run.run_id);
+      mkdirSync(dirname(file), { recursive: true });
+      const payload = {
+        conversation_id: conversationId,
+        run_id: run.run_id,
+        status: run.status ?? 'unknown',
+        ended_at: run.ended_at ?? Date.now(),
+        error: run.error ?? run.result?.error ?? null,
+        result: sanitizeResultForSentinel(run.result ?? null),
+      };
+      const tmp = `${file}.tmp.${process.pid}.${Math.random().toString(36).slice(2)}`;
+      writeFileSync(tmp, JSON.stringify(payload, null, 2), 'utf8');
+      renameSync(tmp, file);
+    } catch (e) {
+      this.log.info(`[hub] 写完成哨兵失败: ${e.message}`);
+    }
+  }
+
+  /**
+   * 启动时清理过期哨兵（默认 7 天前）与崩溃残留的 .tmp 文件。
+   *
+   * 哨兵内含完整正文，不清理会无声堆积。设为 DSH_MCP_SENTINEL_TTL_MS=0 可关闭。
+   * 只在服务启动时做一次，因此绝不会删掉"当前正在等待的"哨兵（那时它还不需要存在）。
+   */
+  pruneSentinels({ ttlMs = SENTINEL_TTL_MS } = {}) {
+    if (!ttlMs || !existsSync(RUNS_DIR)) return { pruned: 0, dirs_removed: 0 };
+    let pruned = 0;
+    let dirsRemoved = 0;
+    const cutoff = Date.now() - ttlMs;
+    try {
+      for (const entry of readdirSync(RUNS_DIR, { withFileTypes: true })) {
+        if (!entry.isDirectory()) continue;
+        const dir = join(RUNS_DIR, entry.name);
+        for (const f of readdirSync(dir, { withFileTypes: true })) {
+          if (!f.isFile()) continue;
+          const fp = join(dir, f.name);
+          try {
+            if (statSync(fp).mtimeMs < cutoff) {
+              rmSync(fp, { force: true });
+              pruned++;
+            }
+          } catch {
+            /* 单个文件失败就跳过 */
+          }
+        }
+        try {
+          if (readdirSync(dir).length === 0) {
+            rmSync(dir, { recursive: true, force: true });
+            dirsRemoved++;
+          }
+        } catch {
+          /* 目录清理失败无所谓 */
+        }
+      }
+    } catch (e) {
+      this.log.info(`[hub] 清理哨兵失败: ${e.message}`);
+    }
+    return { pruned, dirs_removed: dirsRemoved };
+  }
+
+  /** 删除某个 run 的哨兵（起跑前防御性清残留；调用方消费后也可自行删）。 */
+  clearRunSentinel(conversationId, runId) {
+    try {
+      rmSync(this.runSentinelPath(conversationId, runId), { force: true });
+    } catch {
+      /* 忽略：清理失败不影响任何主流程 */
     }
   }
 

@@ -32,6 +32,20 @@ DSH 自己有文件读写、shell、搜索、技能、子代理等全套工具�
 4. dsh_interject / dsh_interrupt              跑偏了就插话改口 / 直接打断
 5. dsh_release                                交还会话（释放写锁，之后仍可 resume）
 
+【异步完成：跑完自动通知，别傻等也别狂轮询】
+wait=false 会立刻返回 run_id 和 **sentinel_file**（一个文件路径）。回合结束时——无论成功、失败还是被取消——
+本服务都会**原子写出**这个文件，内容含该 run 的最终 result 与 status。于是你有三种收活姿势：
+- **首选（真·跑完通知，不占轮次）**：用你自己的后台任务等这个文件出现。文件一到，宿主就唤醒你，
+  你再读文件即得结果。示例（Bash，注意把 Windows 路径的盘符写成 /d/… 、反斜杠改成正斜杠）：
+    sent='/d/AI_MCP/DSH_MCP/.state/runs/<conversation_id>/<run_id>.json'
+    dl=$(( $(date +%s)+2100 )); until [ -f "$sent" ]; do [ $(date +%s) -ge $dl ] && { echo TIMEOUT; exit 1; }; sleep 2; done; echo DONE
+  读文件即可拿到 status 和 result；**不受内存窗口限制、也扛本服务重启**。文件里 status=error 表示失败。
+- 想阻塞拿结果、且预计几分钟内完成 → 干脆 **wait=true**，结果直接在返回里，连文件都不用。
+- 临时查一下 → dsh_get(conversation_id, run_id) 取结果 / dsh_status 看是否在跑 / dsh_read 看增量输出。
+本服务**不会**主动给你发 MCP 通知（协议上只应答请求）；"跑完通知"就是靠上面这个哨兵文件 + 你的后台等待任务实现的。
+**多会话并发安全**：哨兵路径按 conversation_id 分目录，不同会话的 run 各写各的、不串台；每个 run 起一个独立的
+等待任务即可，各自完成、各自唤醒你。哨兵是一次性闩锁：即便 run 在你启动等待任务之前就已完成，[ -f ] 也会立刻为真。
+
 【选择建议】
 - 任务可能超过一两分钟 → **用 wait=false**。MCP 工具调用是阻塞的，傻等会把你自己卡住。
 - 会话在忙时**不要**再 dsh_send：想改口用 dsh_interject，想停用 dsh_interrupt，

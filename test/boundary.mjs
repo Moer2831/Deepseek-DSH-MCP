@@ -6,8 +6,10 @@
 
 import { mkdtempSync, mkdirSync, rmSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { McpClient } from './mcp-client.mjs';
+import { pruneEmptyWorkspaces, purgeTestSessions } from '../src/workspace.mjs';
 
 let pass = 0;
 let failCount = 0;
@@ -92,18 +94,34 @@ try {
     JSON.stringify(okStart?.structuredContent?.workspace_registered),
   );
 
-  // 真实（非临时）工作区应当被登记，否则 GUI 里看不到这些会话
-  const realWs = join(process.env.USERPROFILE ?? '', 'Desktop', 'dsh-mcp-test-A');
+  // 真实（非临时）工作区应当被登记，否则 GUI 里看不到这些会话。
+  // 自己造一个非临时目录（不能依赖桌面上某个文件夹 —— 那是会被清理掉的外部状态），
+  // 用仓库下 .state/ 里的子目录（已被 .gitignore 覆盖），测完删掉并清理注册表条目。
+  const realWs = join(dirname(fileURLToPath(import.meta.url)), '..', '.state', `ws-probe-${Date.now()}`);
   let realStart = null;
-  if (existsSync(realWs)) {
+  mkdirSync(realWs, { recursive: true });
+  try {
     realStart = await client.callTool('dsh_start', { cwd: realWs }, 120_000);
     check(
-      '非临时目录（桌面）会被登记进 DSH 注册表',
+      '非临时目录会被登记进 DSH 注册表',
       realStart?.structuredContent?.workspace_registered === true,
       JSON.stringify(realStart?.structuredContent?.workspace_registered),
     );
-  } else {
-    console.log(`  · 跳过"真实目录登记"检查（${realWs} 不存在）`);
+  } finally {
+    // 无论断言成败都要清干净：删会话 + 删目录 + 摘掉工作区登记
+    if (realStart?.structuredContent?.conversation_id) {
+      const id = realStart.structuredContent.conversation_id;
+      await client.callTool('dsh_release', { conversation_id: id, forget: true });
+      // 只 forget 不够：DSH 的会话目录还在磁盘上，工作区条目就不会变空。
+      // 用显式 id 精确删掉这条会话，再让注册表对账。
+      purgeTestSessions({ ids: [id] });
+    }
+    try {
+      rmSync(realWs, { recursive: true, force: true });
+      pruneEmptyWorkspaces();
+    } catch {
+      /* 清理失败不影响测试结论 */
+    }
   }
 
   const lowEffort = await client.callTool('dsh_start', { cwd: goodWs, reasoning_effort: 'low' }, 120_000);
