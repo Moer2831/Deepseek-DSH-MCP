@@ -61,6 +61,8 @@ export function resolveDshBin() {
   }
   const candidates = [
     findInNpxCache(),
+    join(homedir(), '.dsh', 'profiles', 'node_modules', DSH_ENTRY),
+    join(homedir(), '.dsh', 'node_modules', DSH_ENTRY),
     join(homedir(), 'AppData', 'Roaming', 'npm', 'node_modules', DSH_ENTRY),
     join('/usr', 'local', 'lib', 'node_modules', DSH_ENTRY),
     join('/usr', 'lib', 'node_modules', DSH_ENTRY),
