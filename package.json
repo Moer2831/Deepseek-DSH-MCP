@@ -9,7 +9,8 @@
   },
   "scripts": {
     "start": "node ./bin/dsh-mcp.mjs",
-    "test": "node ./test/run.mjs"
+    "test": "node ./test/run.mjs",
+    "install-client": "node ./bin/install.mjs"
   },
   "engines": {
     "node": ">=20"

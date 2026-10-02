@@ -2,7 +2,7 @@
 
 **English** | [中文](README.zh.md)
 
-> **Give Claude Code / Codex a coding buddy that sticks around** — powered by DeepSeek Harness.
+> **Give AGY (Antigravity) / Claude Code / Codex a coding buddy that sticks around** — powered by DeepSeek Harness.
 
 An MCP server that drives DSH as a **long-lived agent runtime** instead of wrapping a CLI. Open a conversation, hand it a goal, and it writes code, runs scripts and spawns its own subagents — while you watch, cut in, and collect the result whenever you like. 🛠️
 
@@ -80,6 +80,30 @@ Then edit `~/.dsh/profiles/dsh-mcp/cordis.patch.yml` and declare your provider a
 > 2. **ACP's `reasoning_effort` defaults to empty** (= "Provider default"), not to the maximum. This server explicitly sets it to `max` on every `session/new` and after every `session/resume` — because a fresh process does not remember the previous choice.
 
 ### 2. Register the server
+ 
+**One-Click Auto Setup (Recommended)**
+
+Automatically configures AGY, Cursor, Claude Code, and Gemini CLI, and installs the AGY skill:
+
+```bash
+npm run install-client
+# or node ./bin/install.mjs
+```
+
+**Manual Configuration**
+
+**Google Antigravity (AGY Global `~/.gemini/config/mcp_config.json`)**
+
+```json
+{
+  "mcpServers": {
+    "dsh-mcp": {
+      "command": "node",
+      "args": ["/absolute/path/to/DeepSeek-DSH-MCP/bin/dsh-mcp.mjs"]
+    }
+  }
+}
+```
 
 **Claude Code**
 
@@ -95,7 +119,7 @@ command = "node"
 args = ["/absolute/path/to/DeepSeek-DSH-MCP/bin/dsh-mcp.mjs"]
 ```
 
-**Generic MCP client**
+**Generic / Cursor MCP Client (`~/.cursor/mcp.json`)**
 
 ```json
 {
