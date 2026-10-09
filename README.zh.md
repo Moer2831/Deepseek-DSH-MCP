@@ -2,7 +2,7 @@
 
 [English](README.md) | **中文**
 
-> **让你的 Claude Code / Codex 多一个"能长期共事的编码搭子"** —— 背后是 DeepSeek Harness。
+> **让你的 AGY (Antigravity) / Claude Code / Codex 多一个"能长期共事的编码搭子"** —— 背后是 DeepSeek Harness。
 
 一个 MCP 服务端：把 DSH 当作**长驻的 agent 运行时**来驱动，而不是包一层命令行。开个会话、扔个目标，它自己写代码、跑脚本、派子代理；你随时能看、能插话、能回头验收。🛠️
 
@@ -81,6 +81,30 @@ dsh dsh-mcp --from-default-profile acp
 
 ### 2. 注册 MCP 服务
 
+**一键自动配置（推荐）**
+
+支持自动检测并写入 AGY、Cursor、Claude Code、Gemini CLI 等客户端配置，并安装 AGY 专属 Skill：
+
+```bash
+npm run install-client
+# 或 node ./bin/install.mjs
+```
+
+**手动配置方式**
+
+**Google Antigravity (AGY 全局配置 `~/.gemini/config/mcp_config.json`)**
+
+```json
+{
+  "mcpServers": {
+    "dsh-mcp": {
+      "command": "node",
+      "args": ["/绝对路径/DeepSeek-DSH-MCP/bin/dsh-mcp.mjs"]
+    }
+  }
+}
+```
+
 **Claude Code**
 
 ```bash
@@ -95,7 +119,7 @@ command = "node"
 args = ["/绝对路径/DeepSeek-DSH-MCP/bin/dsh-mcp.mjs"]
 ```
 
-**通用 MCP 客户端**
+**通用 / Cursor MCP 客户端（`~/.cursor/mcp.json`）**
 
 ```json
 {
